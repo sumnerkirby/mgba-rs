@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/mgba-core", "crates/mgba-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.mgba-core]
+opt-level = 3
+overflow-checks = false
+
+[profile.release.package.mgba-core]
+overflow-checks = false

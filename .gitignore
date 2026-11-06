@@ -1,0 +1,3 @@
+target/
+# Upstream mGBA source, used as reference and test data; clone it separately
+mgba-master/
