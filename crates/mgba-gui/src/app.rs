@@ -4,16 +4,28 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, ColorImage, Key, TextureHandle, TextureOptions};
-use mgba_core::gba::{keys, LogLevel, ARM7TDMI_FREQUENCY};
-use mgba_core::Gba;
+use mgba_core::gb::{self, model};
+use mgba_core::gba::{keys, LogLevel};
+use mgba_core::{Gb, Gba};
 use serde::{Deserialize, Serialize};
 
 use crate::audio::{AudioOut, Resampler};
+use crate::core::{detect_platform, Core, Platform};
 
+/// Screen size shown before a game is loaded (the GBA's).
 const GBA_W: usize = 240;
 const GBA_H: usize = 160;
-/// 16777216 Hz / 280896 cycles per frame
-const GBA_FPS: f64 = ARM7TDMI_FREQUENCY as f64 / 280896.0;
+
+/// Game Boy models offered in the Emulation menu (`gb.model` and friends in mGBA).
+const GB_MODELS: [(&str, u8); 7] = [
+    ("Autodetect", model::AUTODETECT),
+    ("Game Boy (DMG)", model::DMG),
+    ("Game Boy Pocket (MGB)", model::MGB),
+    ("Super Game Boy (SGB)", model::SGB),
+    ("Super Game Boy 2 (SGB2)", model::SGB2),
+    ("Game Boy Color (CGB)", model::CGB),
+    ("Game Boy Advance (AGB)", model::AGB),
+];
 const SETTINGS_KEY: &str = "mgba-rs-settings";
 const MAX_RECENT: usize = 10;
 
@@ -85,6 +97,12 @@ pub struct Settings {
     pub volume: f32,
     pub muted: bool,
     pub bios_path: Option<PathBuf>,
+    /// Game Boy / Super Game Boy boot ROM (`gb.bios`)
+    pub gb_bios_path: Option<PathBuf>,
+    /// Game Boy Color boot ROM (`gbc.bios`)
+    pub gbc_bios_path: Option<PathBuf>,
+    /// Forced Game Boy model, `model::AUTODETECT` to follow the cartridge.
+    pub gb_model: u8,
     pub skip_bios: bool,
     pub keymap: Vec<(Button, Key)>,
     pub recent_roms: Vec<PathBuf>,
@@ -102,6 +120,9 @@ impl Default for Settings {
             volume: 1.0,
             muted: false,
             bios_path: None,
+            gb_bios_path: None,
+            gbc_bios_path: None,
+            gb_model: model::AUTODETECT,
             skip_bios: false,
             // mGBA's default keyboard layout
             keymap: vec![
@@ -136,7 +157,7 @@ impl Settings {
 }
 
 struct Emulator {
-    gba: Gba,
+    core: Core,
     rom_path: PathBuf,
     save_path: PathBuf,
     title: String,
@@ -148,7 +169,7 @@ impl Emulator {
     }
 
     fn write_save(&mut self) -> std::io::Result<bool> {
-        if let Some(data) = self.gba.savedata() {
+        if let Some(data) = self.core.savedata() {
             std::fs::write(&self.save_path, data)?;
             return Ok(true);
         }
@@ -248,37 +269,26 @@ impl App {
                 return;
             }
         };
-        if data.len() < 0xC0 {
-            self.error = Some(format!("{} is too small to be a GBA ROM", path.display()));
+        let Some(platform) = detect_platform(path, &data) else {
+            self.error = Some(format!("{} doesn't look like a Game Boy or Game Boy Advance ROM", path.display()));
             return;
-        }
-        let mut gba = Gba::new();
-        gba.log_enabled = self.show_log;
-        if let Some(bios_path) = &self.settings.bios_path {
-            match std::fs::read(bios_path) {
-                Ok(bios) if gba.load_bios(&bios) => {}
-                Ok(_) => self.set_status("BIOS image rejected (wrong size or known-bad dump); using built-in BIOS"),
-                Err(e) => self.set_status(format!("Couldn't read BIOS ({e}); using built-in BIOS")),
-            }
-        }
-        gba.skip_bios_on_reset = self.settings.skip_bios;
-        if !gba.load_rom(data) {
+        };
+        let save_path = path.with_extension("sav");
+        let save = std::fs::read(&save_path).ok();
+        let core = match platform {
+            Platform::Gba => self.make_gba(data, save.as_deref()),
+            Platform::Gb => self.make_gb(data, save.as_deref()),
+        };
+        let Some(core) = core else {
             self.error = Some(format!("Couldn't load {}", path.display()));
             return;
-        }
-        let save_path = path.with_extension("sav");
-        // Overrides pick the save type before existing save data is applied.
-        gba.reset();
-        if let Ok(save) = std::fs::read(&save_path) {
-            gba.load_save(&save);
-            gba.reset();
-        }
-        let mut title = gba.game_title();
+        };
+        let mut title = core.game_title();
         if title.is_empty() {
             title = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("mGBA-rs — {title}")));
-        self.emu = Some(Emulator { gba, rom_path: path.to_path_buf(), save_path, title: title.clone() });
+        self.emu = Some(Emulator { core, rom_path: path.to_path_buf(), save_path, title: title.clone() });
         self.paused = false;
         self.acc = 0.0;
         self.last_tick = None;
@@ -291,6 +301,69 @@ impl App {
         self.set_status(format!("Loaded {title}"));
     }
 
+    fn make_gba(&mut self, data: Vec<u8>, save: Option<&[u8]>) -> Option<Core> {
+        if data.len() < 0xC0 {
+            return None;
+        }
+        let mut gba = Gba::new();
+        gba.log_enabled = self.show_log;
+        if let Some(bios_path) = &self.settings.bios_path {
+            match std::fs::read(bios_path) {
+                Ok(bios) if gba.load_bios(&bios) => {}
+                Ok(_) => self.set_status("BIOS image rejected (wrong size or known-bad dump); using built-in BIOS"),
+                Err(e) => self.set_status(format!("Couldn't read BIOS ({e}); using built-in BIOS")),
+            }
+        }
+        gba.skip_bios_on_reset = self.settings.skip_bios;
+        if !gba.load_rom(data) {
+            return None;
+        }
+        // Overrides pick the save type before existing save data is applied.
+        gba.reset();
+        if let Some(save) = save {
+            gba.load_save(save);
+            gba.reset();
+        }
+        Some(Core::Gba(Box::new(gba)))
+    }
+
+    fn make_gb(&mut self, data: Vec<u8>, save: Option<&[u8]>) -> Option<Core> {
+        let mut gb = Gb::new();
+        gb.log_enabled = self.show_log;
+        let m = self.settings.gb_model;
+        if m != model::AUTODETECT {
+            let c = &mut gb.model_config;
+            c.gb = Some(m);
+            c.sgb = Some(m);
+            c.cgb = Some(m);
+            c.cgb_hybrid = Some(m);
+            c.cgb_sgb = Some(m);
+        }
+        if !gb.load_rom(data) {
+            return None;
+        }
+        // Boot ROMs are only used with a matching model; prefer the one for this cartridge.
+        let cgb_cart = gb.is_cgb_rom() && (m == model::AUTODETECT || m >= model::CGB);
+        let bios_path = if cgb_cart || m >= model::CGB && m != model::AUTODETECT {
+            self.settings.gbc_bios_path.clone()
+        } else {
+            self.settings.gb_bios_path.clone()
+        };
+        if let Some(bios_path) = bios_path {
+            match std::fs::read(&bios_path) {
+                Ok(bios) if gb.load_bios(&bios) => {}
+                Ok(_) => self.set_status("Boot ROM not recognized; starting without it"),
+                Err(e) => self.set_status(format!("Couldn't read boot ROM ({e}); starting without it")),
+            }
+        }
+        gb.skip_bios_on_reset = self.settings.skip_bios;
+        if let Some(save) = save {
+            gb.load_save(save);
+        }
+        gb.reset();
+        Some(Core::Gb(Box::new(gb)))
+    }
+
     fn close_rom(&mut self) {
         if let Some(mut emu) = self.emu.take() {
             if let Err(e) = emu.write_save() {
@@ -301,14 +374,34 @@ impl App {
 
     fn open_rom_dialog(&mut self, ctx: &egui::Context) {
         let mut dialog = rfd::FileDialog::new()
-            .set_title("Open GBA ROM")
+            .set_title("Open ROM")
+            .add_filter("Game Boy / Game Boy Advance ROM", &["gba", "agb", "bin", "gb", "gbc", "sgb", "cgb"])
             .add_filter("Game Boy Advance ROM", &["gba", "agb", "bin"])
+            .add_filter("Game Boy (Color) ROM", &["gb", "gbc", "sgb", "cgb"])
             .add_filter("All files", &["*"]);
         if let Some(dir) = self.settings.recent_roms.first().and_then(|p| p.parent()) {
             dialog = dialog.set_directory(dir);
         }
         if let Some(path) = dialog.pick_file() {
             self.load_rom(ctx, &path);
+        }
+    }
+
+    fn choose_gb_bios_dialog(&mut self, color: bool) {
+        let title = if color { "Select Game Boy Color boot ROM (gbc_bios.bin)" } else { "Select Game Boy boot ROM (gb_bios.bin)" };
+        if let Some(path) = rfd::FileDialog::new().set_title(title).add_filter("Boot ROM", &["bin", "rom", "gb", "gbc"]).pick_file() {
+            match std::fs::read(&path) {
+                Ok(data) if gb::is_bios(&data) => {
+                    if color {
+                        self.settings.gbc_bios_path = Some(path);
+                    } else {
+                        self.settings.gb_bios_path = Some(path);
+                    }
+                    self.set_status("Boot ROM set; it will be used the next time a game is loaded");
+                }
+                Ok(_) => self.error = Some("That file isn't a known Game Boy boot ROM.".into()),
+                Err(e) => self.error = Some(format!("Couldn't read boot ROM: {e}")),
+            }
         }
     }
 
@@ -332,7 +425,7 @@ impl App {
     fn save_state(&mut self, slot: u32) {
         let Some(emu) = &self.emu else { return };
         let path = emu.state_path(slot);
-        match std::fs::write(&path, emu.gba.save_state()) {
+        match std::fs::write(&path, emu.core.save_state()) {
             Ok(()) => self.set_status(format!("Saved state to slot {slot}")),
             Err(e) => self.error = Some(format!("Couldn't write {}: {e}", path.display())),
         }
@@ -341,7 +434,7 @@ impl App {
     fn load_state(&mut self, slot: u32) {
         let Some(emu) = &mut self.emu else { return };
         let path = emu.state_path(slot);
-        let result = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|d| emu.gba.load_state(&d).map_err(|e| e.to_string()));
+        let result = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|d| emu.core.load_state(&d));
         match result {
             Ok(()) => {
                 self.set_status(format!("Loaded state from slot {slot}"));
@@ -365,10 +458,11 @@ impl App {
             }
             n += 1;
         };
-        let rgb: Vec<u8> = emu.gba.framebuffer().iter().flat_map(|&p| [p as u8, (p >> 8) as u8, (p >> 16) as u8]).collect();
+        let rgb: Vec<u8> = emu.core.framebuffer().iter().flat_map(|&p| [p as u8, (p >> 8) as u8, (p >> 16) as u8]).collect();
+        let [w, h] = emu.core.screen_size();
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
             let file = std::fs::File::create(&path)?;
-            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), GBA_W as u32, GBA_H as u32);
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
             enc.set_color(png::ColorType::Rgb);
             enc.set_depth(png::BitDepth::Eight);
             enc.write_header()?.write_image_data(&rgb)?;
@@ -382,7 +476,7 @@ impl App {
 
     fn reset(&mut self) {
         if let Some(emu) = &mut self.emu {
-            emu.gba.reset();
+            emu.core.reset();
             self.set_status("Reset");
         }
     }
@@ -416,14 +510,15 @@ impl App {
 
         let fast_forward = self.fast_forward_toggle || ctx.input(|i| i.key_down(Key::Tab));
         let keys = self.read_keys(ctx);
+        let fps_target = self.emu.as_ref().map(|e| e.core.fps()).unwrap_or(60.0);
 
         self.acc += dt;
         if self.acc > 0.25 {
             // We fell far behind (window dragged, system stall); don't try to catch up.
-            self.acc = 1.0 / GBA_FPS;
+            self.acc = 1.0 / fps_target;
         }
         let mut frames = 0u32;
-        let frame_time = 1.0 / GBA_FPS;
+        let frame_time = 1.0 / fps_target;
         let max_frames = if fast_forward { self.settings.fast_forward_multiplier.max(1) } else { 1 };
         while self.acc >= frame_time {
             self.acc -= frame_time;
@@ -437,23 +532,22 @@ impl App {
         }
 
         let emu = self.emu.as_mut().unwrap();
-        emu.gba.set_keys(keys);
+        emu.core.set_keys(keys);
         self.audio_scratch.clear();
         for _ in 0..frames {
-            emu.gba.run_frame();
-            emu.gba.drain_audio(&mut self.audio_scratch);
+            emu.core.run_frame();
+            emu.core.drain_audio(&mut self.audio_scratch);
             if fast_forward {
                 self.audio_scratch.clear();
             }
         }
-        if emu.gba.savedata_updated {
-            emu.gba.savedata_updated = false;
+        if emu.core.take_savedata_updated() {
             if let Err(e) = emu.write_save() {
                 self.error = Some(format!("Couldn't write save file: {e}"));
             }
         }
         if self.show_log {
-            for (level, msg) in emu.gba.drain_log() {
+            for (level, msg) in emu.core.drain_log() {
                 if !matches!(level, LogLevel::Debug) {
                     self.log_lines.push(format!("[{level:?}] {msg}"));
                 }
@@ -469,7 +563,7 @@ impl App {
                 let target = audio.rate as f64 * 0.05;
                 let fill = audio.buffered() as f64;
                 let adjust = 1.0 + 0.005 * ((fill - target) / target).clamp(-1.0, 1.0);
-                let in_rate = emu.gba.audio_sample_rate() as f64;
+                let in_rate = emu.core.audio_sample_rate() as f64;
                 let out = self.resampler.process(&self.audio_scratch, in_rate, audio.rate as f64, adjust);
                 audio.push(out);
             }
@@ -477,20 +571,18 @@ impl App {
     }
 
     fn update_texture(&mut self, ctx: &egui::Context) {
-        let pixels: Vec<Color32> = match &self.emu {
-            Some(emu) => emu
-                .gba
-                .framebuffer()
-                .iter()
-                .map(|&p| Color32::from_rgb(p as u8, (p >> 8) as u8, (p >> 16) as u8))
-                .collect(),
-            None => vec![Color32::BLACK; GBA_W * GBA_H],
+        let (size, pixels): ([usize; 2], Vec<Color32>) = match &self.emu {
+            Some(emu) => (
+                emu.core.screen_size(),
+                emu.core.framebuffer().iter().map(|&p| Color32::from_rgb(p as u8, (p >> 8) as u8, (p >> 16) as u8)).collect(),
+            ),
+            None => ([GBA_W, GBA_H], vec![Color32::BLACK; GBA_W * GBA_H]),
         };
-        let image = ColorImage::new([GBA_W, GBA_H], pixels);
+        let image = ColorImage::new(size, pixels);
         let options = if self.settings.smooth { TextureOptions::LINEAR } else { TextureOptions::NEAREST };
         match &mut self.texture {
             Some(t) => t.set(image, options),
-            None => self.texture = Some(ctx.load_texture("gba-screen", image, options)),
+            None => self.texture = Some(ctx.load_texture("screen", image, options)),
         }
     }
 
@@ -634,10 +726,10 @@ impl App {
                 });
                 ui.checkbox(&mut self.settings.pause_when_unfocused, "Pause when window is inactive");
                 ui.separator();
-                ui.label("BIOS");
+                ui.label("GBA BIOS");
                 let bios = self.settings.bios_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Built-in (HLE)".into());
                 ui.label(egui::RichText::new(bios).small());
-                if ui.button("Choose BIOS file…").clicked() {
+                if ui.button("Choose GBA BIOS file…").clicked() {
                     ui.close();
                     self.choose_bios_dialog();
                 }
@@ -645,20 +737,52 @@ impl App {
                     self.settings.bios_path = None;
                     self.set_status("Built-in BIOS will be used the next time a game is loaded");
                 }
+                ui.separator();
+                ui.label("Game Boy boot ROMs (optional)");
+                for (color, label) in [(false, "Game Boy"), (true, "Game Boy Color")] {
+                    let current = if color { &self.settings.gbc_bios_path } else { &self.settings.gb_bios_path };
+                    let shown = current.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "None (skip boot animation)".into());
+                    ui.label(egui::RichText::new(format!("{label}: {shown}")).small());
+                    ui.horizontal(|ui| {
+                        if ui.button(format!("Choose {label} boot ROM…")).clicked() {
+                            ui.close();
+                            self.choose_gb_bios_dialog(color);
+                        }
+                        let has = if color { self.settings.gbc_bios_path.is_some() } else { self.settings.gb_bios_path.is_some() };
+                        if has && ui.button("Clear").clicked() {
+                            if color {
+                                self.settings.gbc_bios_path = None;
+                            } else {
+                                self.settings.gb_bios_path = None;
+                            }
+                        }
+                    });
+                }
                 if ui.checkbox(&mut self.settings.skip_bios, "Skip BIOS intro").changed() {
                     if let Some(emu) = &mut self.emu {
-                        emu.gba.skip_bios_on_reset = self.settings.skip_bios;
+                        emu.core.set_skip_bios(self.settings.skip_bios);
                     }
                 }
+                ui.separator();
+                ui.menu_button("Game Boy model", |ui| {
+                    for (name, m) in GB_MODELS {
+                        if ui.radio(self.settings.gb_model == m, name).clicked() {
+                            self.settings.gb_model = m;
+                            self.set_status("Model change takes effect the next time a Game Boy game is loaded");
+                            ui.close();
+                        }
+                    }
+                });
             });
 
             ui.menu_button("Video", |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Window size:");
+                    let [w, h] = self.emu.as_ref().map(|e| e.core.screen_size()).unwrap_or([GBA_W, GBA_H]);
                     for s in 1..=6 {
                         if ui.button(format!("{s}×")).clicked() {
                             self.settings.scale = s as f32;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(GBA_W as f32 * s as f32, GBA_H as f32 * s as f32 + 68.0)));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w as f32 * s as f32, h as f32 * s as f32 + 68.0)));
                         }
                     }
                 });
@@ -673,21 +797,34 @@ impl App {
                 if let Some(emu) = &mut self.emu {
                     ui.separator();
                     ui.label("Layers");
-                    let r = &mut emu.gba.renderer;
-                    for i in 0..4 {
-                        let mut on = !r.disable_bg[i];
-                        if ui.checkbox(&mut on, format!("Background {i}")).changed() {
-                            r.disable_bg[i] = !on;
+                    match &mut emu.core {
+                        Core::Gba(g) => {
+                            let r = &mut g.renderer;
+                            for i in 0..4 {
+                                let mut on = !r.disable_bg[i];
+                                if ui.checkbox(&mut on, format!("Background {i}")).changed() {
+                                    r.disable_bg[i] = !on;
+                                }
+                            }
+                            let mut on = !r.disable_obj;
+                            if ui.checkbox(&mut on, "Sprites").changed() {
+                                r.disable_obj = !on;
+                            }
+                            let mut on = !r.disable_win[0] && !r.disable_win[1];
+                            if ui.checkbox(&mut on, "Windows").changed() {
+                                r.disable_win = [!on, !on];
+                                r.disable_objwin = !on;
+                            }
                         }
-                    }
-                    let mut on = !r.disable_obj;
-                    if ui.checkbox(&mut on, "Sprites").changed() {
-                        r.disable_obj = !on;
-                    }
-                    let mut on = !r.disable_win[0] && !r.disable_win[1];
-                    if ui.checkbox(&mut on, "Windows").changed() {
-                        r.disable_win = [!on, !on];
-                        r.disable_objwin = !on;
+                        Core::Gb(g) => {
+                            let r = &mut g.renderer;
+                            for (flag, name) in [(&mut r.disable_bg, "Background"), (&mut r.disable_win, "Window"), (&mut r.disable_obj, "Sprites")] {
+                                let mut on = !*flag;
+                                if ui.checkbox(&mut on, name).changed() {
+                                    *flag = !on;
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -701,20 +838,33 @@ impl App {
                 if let Some(emu) = &mut self.emu {
                     ui.separator();
                     ui.label("Channels");
-                    let a = &mut emu.gba.audio;
-                    for (i, name) in ["Square 1", "Square 2", "Wave", "Noise"].iter().enumerate() {
-                        let mut on = !a.psg.force_disable_ch[i];
-                        if ui.checkbox(&mut on, *name).changed() {
-                            a.psg.force_disable_ch[i] = !on;
+                    let names = ["Square 1", "Square 2", "Wave", "Noise"];
+                    match &mut emu.core {
+                        Core::Gba(g) => {
+                            let a = &mut g.audio;
+                            for (i, name) in names.iter().enumerate() {
+                                let mut on = !a.psg.force_disable_ch[i];
+                                if ui.checkbox(&mut on, *name).changed() {
+                                    a.psg.force_disable_ch[i] = !on;
+                                }
+                            }
+                            let mut on = !a.force_disable_ch_a;
+                            if ui.checkbox(&mut on, "Direct Sound A").changed() {
+                                a.force_disable_ch_a = !on;
+                            }
+                            let mut on = !a.force_disable_ch_b;
+                            if ui.checkbox(&mut on, "Direct Sound B").changed() {
+                                a.force_disable_ch_b = !on;
+                            }
                         }
-                    }
-                    let mut on = !a.force_disable_ch_a;
-                    if ui.checkbox(&mut on, "Direct Sound A").changed() {
-                        a.force_disable_ch_a = !on;
-                    }
-                    let mut on = !a.force_disable_ch_b;
-                    if ui.checkbox(&mut on, "Direct Sound B").changed() {
-                        a.force_disable_ch_b = !on;
+                        Core::Gb(g) => {
+                            for (i, name) in names.iter().enumerate() {
+                                let mut on = !g.audio.force_disable_ch[i];
+                                if ui.checkbox(&mut on, *name).changed() {
+                                    g.audio.force_disable_ch[i] = !on;
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -726,7 +876,7 @@ impl App {
                 }
                 if ui.checkbox(&mut self.show_log, "Show emulator log").changed() {
                     if let Some(emu) = &mut self.emu {
-                        emu.gba.log_enabled = self.show_log;
+                        emu.core.set_log_enabled(self.show_log);
                     }
                 }
             });
@@ -744,11 +894,12 @@ impl App {
         let available = ui.available_rect_before_wrap();
         ui.painter().rect_filled(available, 0.0, Color32::BLACK);
         let Some(tex) = &self.texture else { return };
-        let mut scale = (available.width() / GBA_W as f32).min(available.height() / GBA_H as f32);
+        let [w, h] = self.emu.as_ref().map(|e| e.core.screen_size()).unwrap_or([GBA_W, GBA_H]);
+        let mut scale = (available.width() / w as f32).min(available.height() / h as f32);
         if self.settings.integer_scaling && scale >= 1.0 {
             scale = scale.floor();
         }
-        let size = egui::vec2(GBA_W as f32 * scale, GBA_H as f32 * scale);
+        let size = egui::vec2(w as f32 * scale, h as f32 * scale);
         let rect = egui::Rect::from_center_size(available.center(), size);
         if self.emu.is_some() {
             ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
@@ -760,7 +911,7 @@ impl App {
             ui.painter().text(
                 available.center(),
                 egui::Align2::CENTER_CENTER,
-                "Open a GBA ROM (Ctrl+O) or drop one here",
+                "Open a GB, GBC or GBA ROM (Ctrl+O) or drop one here",
                 egui::FontId::proportional(18.0),
                 Color32::from_gray(200),
             );
@@ -776,7 +927,7 @@ impl App {
                     ui.label(format!("{:.1} fps", self.fps.fps));
                     ui.separator();
                 }
-                ui.label(format!("Save: {}", emu.gba.memory.savedata.ty.name()));
+                ui.label(emu.core.cart_info());
             }
             if let Some((msg, at)) = &self.status {
                 if at.elapsed() < Duration::from_secs(4) {
@@ -818,7 +969,7 @@ impl App {
         }
         if self.show_about {
             egui::Window::new("About mGBA-rs").open(&mut self.show_about).resizable(false).collapsible(false).show(ctx, |ui| {
-                ui.label("A Rust port of mGBA's Game Boy Advance emulation core.");
+                ui.label("A Rust port of mGBA's Game Boy Advance and Game Boy / Game Boy Color emulation cores.");
                 ui.label("mGBA is © 2013–2026 Jeffrey Pfau and contributors.");
                 ui.label("Licensed under the Mozilla Public License 2.0.");
             });
@@ -838,7 +989,7 @@ impl App {
             if !open {
                 self.show_log = false;
                 if let Some(emu) = &mut self.emu {
-                    emu.gba.log_enabled = false;
+                    emu.core.set_log_enabled(false);
                 }
             }
         }

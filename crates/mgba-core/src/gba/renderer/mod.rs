@@ -1,2 +1,2 @@
 mod software;
-pub use software::SoftwareRenderer;
+pub use software::{color_from_555, SoftwareRenderer};
