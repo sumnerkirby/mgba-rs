@@ -9,11 +9,14 @@
 pub mod audio;
 pub mod io;
 pub mod mbc;
+pub mod mbc_extra;
 pub mod memory;
 pub mod renderer;
 pub mod serialize;
+pub mod sgb_border;
 pub mod timer;
 pub mod video;
+pub mod video_log;
 
 use std::sync::Arc;
 
@@ -187,7 +190,8 @@ pub struct Gb {
     #[serde(skip)]
     pub bios: Option<Arc<Vec<u8>>>,
     pub sram_size: usize,
-    /// The RTC block at the end of the save file, as mGBA would re-read it on reset.
+    /// The clock block at the end of the save file (MBC3, HuC-3, TAMA5), as
+    /// mGBA would re-read it on reset.
     pub rtc_file: Vec<u8>,
     pub sram_dirty: i32,
     pub sram_dirt_age: u32,
@@ -208,6 +212,10 @@ pub struct Gb {
     pub keys: u16,
     /// Rumble motor state (MBC5 rumble carts).
     pub rumble: bool,
+    /// Image the Pocket Camera captures: 128x112, 8-bit grayscale, row-major.
+    /// `None` leaves captures untouched, as mGBA does with no camera attached.
+    #[serde(skip)]
+    pub camera_image: Option<Vec<u8>>,
 
     /// Model the frontend asked for, per cartridge type (unset follows the cartridge).
     pub model_config: ModelConfig,
@@ -216,6 +224,9 @@ pub struct Gb {
     /// `RTC_FAKE_EPOCH` with this base (milliseconds); `None` uses the wall clock.
     pub rtc_fake_epoch_ms: Option<i64>,
 
+    /// Active cheats (`CPU_COMPONENT_CHEAT_DEVICE`), applied at the end of each frame.
+    #[serde(skip)]
+    pub cheats: crate::cheats::CheatDevice,
     #[serde(skip)]
     pub log: Vec<(LogLevel, String)>,
     #[serde(skip)]
@@ -352,9 +363,11 @@ impl Gb {
             allow_opposing_directions: true,
             keys: 0,
             rumble: false,
+            camera_image: None,
             model_config: ModelConfig::default(),
             skip_bios_on_reset: false,
             rtc_fake_epoch_ms: None,
+            cheats: crate::cheats::CheatDevice::new(),
             log: Vec::new(),
             log_enabled: false,
             savedata_updated: false,
@@ -533,8 +546,7 @@ impl Gb {
         self.timing.interrupt();
     }
 
-    /// The built-in override table (`_overrides` in src/gb/overrides.c), limited
-    /// to the mappers this port implements.
+    /// The built-in override table (`_overrides` in src/gb/overrides.c).
     fn apply_overrides(&mut self) {
         if self.memory.rom.len() < 0x150 {
             return;
@@ -542,8 +554,22 @@ impl Gb {
         let crc = crc32(&self.memory.rom[0x100..0x150]);
         let mbc = match crc {
             0xA61F3EE1 => mbc::M161, // Mani 4 in 1 - Tetris + Alleyway + Yakuman + Tennis
-            // Pokemon Spaceworld 1997 demo
+            // Pokemon Spaceworld 1997 demo (Gold/Silver, debug and non-debug)
             0x232A067D | 0x630ED957 | 0x5AFF0038 | 0xA61856BD => mbc::MBC3_RTC,
+            // Unlicensed bootlegs
+            0x30F8F86C => mbc::UNL_PKJD, // Pokemon Jade Version (Telefang Speed bootleg)
+            0xE1147E75 | 0xEFF88FAA => mbc::UNL_NT_OLD_1, // Rockman 8; True Color 25 in 1
+            // 23 in 1, 29 in 1, Caise Gedou 24/29 in 1, Rockman X4, Sonic Adventure 8,
+            // Super Donkey Kong 5, Super Mario Special 3
+            0x811925D9 | 0x62A8016A | 0x5758D6D9 | 0x80265A64 | 0x805459DE | 0x0B1B808A | 0x4650EB9A => {
+                mbc::UNL_NT_OLD_2
+            }
+            // Capcom vs SNK, Digimon 02 4, Digimon 2, Digimon Pocket, Harry Potter 3,
+            // Pokemon Diamond/Jade (Special Pikachu Edition), Pokemon - Mewtwo Strikes Back,
+            // Shuma Baolong 02 4, Street Fighter Zero 4
+            0xB289D95A | 0x688D6713 | 0x8931A272 | 0x79083C6B | 0x0C5047EE | 0x8AC634B7 | 0x8628A287 | 0xBC75D7B8
+            | 0xFF0B60CC | 0x14A992A6 => mbc::UNL_NT_NEW,
+            0x3EF5AFB2 => mbc::UNL_LI_CHENG, // Pokemon Jade Version (Telefang Speed bootleg)
             _ => return,
         };
         self.memory.mbc_type = mbc;
@@ -655,6 +681,10 @@ impl Gb {
         for (i, &b) in REGISTERED_TRADEMARK.iter().enumerate() {
             self.patch8(0x8190 + i as u16 * 2, b);
         }
+        if self.memory.mbc_type == mbc::UNL_SACHEN_MMC2 {
+            self.memory.mbc_state.sachen.locked = mbc_extra::SACHEN_UNLOCKED;
+        }
+
         if self.model < model::CGB {
             for i in 0..12u16 {
                 self.patch8(0x9904 + i, i as u8 + 1);
@@ -913,11 +943,18 @@ impl Gb {
     fn frame_ended(&mut self) {
         let frame = self.video.frame_counter;
         if self.sram_clean(frame) {
-            if self.memory.mbc_type == mbc::MBC3_RTC {
-                // GBMBCRTCWrite: the frontend writes savedata() out now
-                self.rtc_file = self.rtc_save_suffix();
+            // GBMBCRTCWrite and friends: the frontend writes savedata() out now
+            let suffix = self.save_suffix();
+            if !suffix.is_empty() {
+                self.rtc_file = suffix;
             }
             self.savedata_updated = true;
+        }
+
+        if !self.cheats.sets.is_empty() {
+            let mut cheats = std::mem::take(&mut self.cheats);
+            cheats.refresh_all(self);
+            self.cheats = cheats;
         }
     }
 
@@ -1008,9 +1045,15 @@ impl Gb {
             let bank = self.memory.sram_current_bank;
             self.mbc_switch_sram_bank(bank);
         }
-        if self.memory.mbc_type == mbc::MBC3_RTC && data.len() > size {
-            self.rtc_file = data[size..].to_vec();
-            self.rtc_load_suffix(&data[size..]);
+        if data.len() > size {
+            let suffix = &data[size..];
+            match self.memory.mbc_type {
+                mbc::MBC3_RTC => self.rtc_load_suffix(suffix),
+                mbc::HUC3 => self.huc3_load_suffix(suffix),
+                mbc::TAMA5 => self.tama5_load_suffix(suffix),
+                _ => return,
+            }
+            self.rtc_file = suffix.to_vec();
         }
     }
 
@@ -1020,10 +1063,18 @@ impl Gb {
             return None;
         }
         let mut out = self.memory.sram[..self.sram_size.min(self.memory.sram.len())].to_vec();
-        if self.memory.mbc_type == mbc::MBC3_RTC {
-            out.extend_from_slice(&self.rtc_save_suffix());
-        }
+        out.extend_from_slice(&self.save_suffix());
         Some(out)
+    }
+
+    /// The block mGBA appends to the save for carts with a clock (empty otherwise).
+    fn save_suffix(&self) -> Vec<u8> {
+        match self.memory.mbc_type {
+            mbc::MBC3_RTC => self.rtc_save_suffix(),
+            mbc::HUC3 => self.huc3_save_suffix(),
+            mbc::TAMA5 => self.tama5_save_suffix(),
+            _ => Vec::new(),
+        }
     }
 
     /// `_GBCoreSetKeys` (GBA KEYINPUT bit order: A, B, Select, Start, Right, Left, Up, Down)
@@ -1040,9 +1091,21 @@ impl Gb {
         }
     }
 
-    /// The most recent completed frame, 160x144, 0x00BBGGRR.
+    /// The most recent completed frame, [`Gb::video_size`] pixels, 0x00BBGGRR.
     pub fn framebuffer(&self) -> &[u32] {
         self.renderer.output()
+    }
+
+    /// Frame size: 256x224 for a Super Game Boy with borders, otherwise 160x144
+    /// (`_GBCoreCurrentVideoSize`).
+    pub fn video_size(&self) -> (usize, usize) {
+        self.renderer.size()
+    }
+
+    /// Show or hide Super Game Boy borders (mGBA's `sgb.borders`, on by default).
+    pub fn set_sgb_borders(&mut self, enable: bool) {
+        self.video.sgb_borders = enable;
+        self.renderer.enable_sgb_border(enable);
     }
 
     /// Move produced audio samples into `out` at [`Gb::audio_sample_rate`].

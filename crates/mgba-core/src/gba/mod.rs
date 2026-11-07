@@ -130,6 +130,9 @@ pub struct Gba {
     /// Set when the game hits a fatal condition (e.g. jumped to an invalid address).
     pub crashed: bool,
     /// Messages logged by the core since the frontend last drained them.
+    /// Active cheats (`CPU_COMPONENT_CHEAT_DEVICE`), applied at the end of each frame.
+    #[serde(skip)]
+    pub cheats: crate::cheats::CheatDevice,
     #[serde(skip)]
     pub log: Vec<(LogLevel, String)>,
     #[serde(skip)]
@@ -195,6 +198,7 @@ impl Gba {
             debug_string: [0; 0x100],
             debug_flags: 0,
             crashed: false,
+            cheats: crate::cheats::CheatDevice::new(),
             log: Vec::new(),
             log_enabled: false,
             savedata_updated: false,
@@ -475,6 +479,11 @@ impl Gba {
         self.memory.savedata.clean(frame);
         if was_dirty && self.memory.savedata.dirty == 0 {
             self.savedata_updated = true;
+        }
+        if !self.cheats.sets.is_empty() {
+            let mut cheats = std::mem::take(&mut self.cheats);
+            cheats.refresh_all(self);
+            self.cheats = cheats;
         }
     }
 

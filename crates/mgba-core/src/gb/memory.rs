@@ -777,3 +777,114 @@ impl Gb {
         false
     }
 }
+
+impl Gb {
+    /// `GBView8` with an explicit bank (`segment`; negative means the mapped bank).
+    pub fn raw_view8(&self, address: u16, segment: i32) -> u8 {
+        let mem = &self.memory;
+        match address >> 12 {
+            0x4..=0x7 if segment >= 0 => {
+                if (segment as usize) * SIZE_CART_BANK0 < mem.rom_size {
+                    mem.rom_byte((address as usize & (SIZE_CART_BANK0 - 1)) + segment as usize * SIZE_CART_BANK0)
+                } else {
+                    0xFF
+                }
+            }
+            0x8 | 0x9 if segment >= 0 => {
+                if segment == 1 && self.model < super::model::CGB || segment >= 2 {
+                    0xFF
+                } else {
+                    self.video.vram[(address as usize & (SIZE_VRAM_BANK0 - 1)) + segment as usize * SIZE_VRAM_BANK0]
+                }
+            }
+            0xA | 0xB if segment >= 0 => {
+                if mem.sram_access && (segment as usize) * SIZE_EXTERNAL_RAM < self.sram_size {
+                    mem.sram
+                        .get((address as usize & (SIZE_EXTERNAL_RAM - 1)) + segment as usize * SIZE_EXTERNAL_RAM)
+                        .copied()
+                        .unwrap_or(0xFF)
+                } else {
+                    self.view8(address)
+                }
+            }
+            0xD if segment >= 0 => {
+                let mut seg = segment as usize;
+                if seg >= 8 || seg > 1 && self.model < super::model::CGB {
+                    return 0xFF;
+                }
+                if seg == 0 {
+                    seg = 1;
+                }
+                mem.wram[(address as usize & (SIZE_WORKING_RAM_BANK0 - 1)) + seg * SIZE_WORKING_RAM_BANK0]
+            }
+            _ => self.view8(address),
+        }
+    }
+
+    /// `GBPatch8` with an explicit bank (`segment`; negative means the mapped bank).
+    pub fn raw_patch8(&mut self, address: u16, segment: i32, value: u8) {
+        match address >> 12 {
+            0x4..=0x7 if segment >= 0 => {
+                if (segment as usize) * SIZE_CART_BANK0 < self.memory.rom_size {
+                    let off = (address as usize & (SIZE_CART_BANK0 - 1)) + segment as usize * SIZE_CART_BANK0;
+                    if let Some(b) = Arc::make_mut(&mut self.memory.rom).get_mut(off) {
+                        *b = value;
+                    }
+                }
+            }
+            0x8 | 0x9 if segment >= 0 => {
+                if !(segment == 1 && self.model < super::model::CGB || segment >= 2) {
+                    self.video.vram[(address as usize & (SIZE_VRAM_BANK0 - 1)) + segment as usize * SIZE_VRAM_BANK0] = value;
+                }
+            }
+            0xD if segment >= 0 => {
+                let mut seg = segment as usize;
+                if seg >= 8 || seg > 1 && self.model < super::model::CGB {
+                    return;
+                }
+                if seg == 0 {
+                    seg = 1;
+                }
+                self.memory.wram[(address as usize & (SIZE_WORKING_RAM_BANK0 - 1)) + seg * SIZE_WORKING_RAM_BANK0] = value;
+            }
+            _ => self.patch8(address, value),
+        }
+    }
+}
+
+impl crate::cheats::CheatBus for Gb {
+    fn bus_read(&mut self, address: u32, width: i32) -> u32 {
+        (0..width.max(1) as u32).fold(0, |acc, i| acc | (self.load8(address.wrapping_add(i) as u16) as u32) << (8 * i))
+    }
+    fn bus_write(&mut self, address: u32, width: i32, value: u32) {
+        for i in 0..width.max(1) as u32 {
+            self.store8(address.wrapping_add(i) as u16, (value >> (8 * i)) as u8);
+        }
+    }
+    fn raw_read(&mut self, address: u32, segment: i32, width: i32) -> u32 {
+        (0..width.max(1) as u32).fold(0, |acc, i| acc | (self.raw_view8(address.wrapping_add(i) as u16, segment) as u32) << (8 * i))
+    }
+    fn raw_write(&mut self, address: u32, segment: i32, width: i32, value: u32) {
+        for i in 0..width.max(1) as u32 {
+            self.raw_patch8(address.wrapping_add(i) as u16, segment, (value >> (8 * i)) as u8);
+        }
+    }
+    fn max_segment(&self, address: u32) -> Option<i32> {
+        // `_GBMemoryBlocks` with the maxSegment values `_GBCoreReset` fills in
+        let cgb = self.model >= super::model::CGB;
+        Some(match address {
+            0x0000..=0x7FFF => ((self.memory.rom_size / SIZE_CART_BANK0) as i32 - 1).max(0),
+            0x8000..=0x9FFF => cgb as i32,
+            0xA000..=0xBFFF => ((self.sram_size / SIZE_EXTERNAL_RAM) as i32 - 1).max(0),
+            0xC000..=0xDFFF => {
+                if cgb {
+                    7
+                } else {
+                    1
+                }
+            }
+            0xFE00..=0xFE9F | 0xFF80..=0xFFFE => 0,
+            _ => return None,
+        })
+    }
+}

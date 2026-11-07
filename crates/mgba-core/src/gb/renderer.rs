@@ -1,9 +1,9 @@
 // Copyright (c) 2013-2016 Jeffrey Pfau
 // Rust port of mGBA's Game Boy software renderer (src/gb/renderers/software.c).
 //
-// Super Game Boy palettes, attribute files and VRAM transfers are ported;
-// SGB border rendering (the 256x224 frame) is not, so output is always
-// 160x144. The debugger's layer highlighting is left out.
+// Super Game Boy palettes, attribute files, VRAM transfers and borders are
+// ported. With SGB borders on, output is 256x224 with the Game Boy screen at
+// (48, 40); otherwise it's 160x144. The debugger's layer highlighting is left out.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -97,6 +97,10 @@ pub struct GbRenderer {
     sgb_packet: [u8; 128],
     sgb_command_header: u8,
     sgb_borders: bool,
+    sgb_border_mask: [u32; 18],
+    /// Output dimensions: 256x224 for SGB with borders, else 160x144.
+    width: usize,
+    height: usize,
 
     pub sgb: SgbState,
 
@@ -149,6 +153,9 @@ impl GbRenderer {
             sgb_packet: [0; 128],
             sgb_command_header: 0,
             sgb_borders: false,
+            sgb_border_mask: [0; 18],
+            width: HORIZONTAL_PIXELS,
+            height: VERTICAL_PIXELS,
             sgb: SgbState::default(),
             disable_bg: false,
             disable_obj: false,
@@ -158,9 +165,103 @@ impl GbRenderer {
         r
     }
 
-    /// The most recent frame, 160x144, 0x00BBGGRR.
+    /// The most recent frame, [`GbRenderer::size`] pixels, 0x00BBGGRR.
     pub fn output(&self) -> &[u32] {
-        &self.output
+        &self.output[..self.width * self.height]
+    }
+
+    /// Output width and height.
+    pub fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    fn uses_borders(&self) -> bool {
+        self.model & model::SGB != 0 && self.sgb_borders
+    }
+
+    fn update_size(&mut self) {
+        let (w, h) = if self.uses_borders() { (256, 224) } else { (HORIZONTAL_PIXELS, VERTICAL_PIXELS) };
+        if (w, h) != (self.width, self.height) || self.output.len() != w * h {
+            self.width = w;
+            self.height = h;
+            self.output = vec![0; w * h];
+        }
+    }
+
+    /// `_regenerateSGBBorder`
+    fn regenerate_sgb_border(&mut self) {
+        if self.sgb.map_ram.len() < SGB_SIZE_MAP_RAM || self.sgb.char_ram.len() < SGB_SIZE_CHAR_RAM {
+            return;
+        }
+        for i in 0..0x40 {
+            let color = self.sgb.map_ram[0x800 + i * 2] as u16 | ((self.sgb.map_ram[0x801 + i * 2] as u16) << 8);
+            self.write_palette(i + PAL_SGB_BORDER, color);
+        }
+        let stride = self.width;
+        let char_word = |r: &GbRenderer, w: usize| -> u32 {
+            let o = w * 4;
+            u32::from_le_bytes(r.sgb.char_ram[o..o + 4].try_into().unwrap())
+        };
+        for y in 0..224usize {
+            let local_y = y & 7;
+            if local_y == 0 && (40..184).contains(&y) {
+                self.sgb_border_mask[(y - 40) >> 3] = 0;
+            }
+            let mut x = 0usize;
+            while x < 256 {
+                let mo = (x >> 2) + (y & !7) * 8;
+                let map_data = self.sgb.map_ram[mo] as u16 | ((self.sgb.map_ram[mo + 1] as u16) << 8);
+                let tile = (map_data & 0x3FF) as usize;
+                if tile >= 0x100 {
+                    x += 8;
+                    continue;
+                }
+                if (48..208).contains(&x) && (40..184).contains(&y) {
+                    if local_y == 0 {
+                        let tile_base = tile * 8;
+                        let mut bits = 0u32;
+                        for k in 0..8 {
+                            bits |= char_word(self, tile_base + k);
+                        }
+                        if bits != 0 {
+                            self.sgb_border_mask[(y - 40) >> 3] |= 1 << ((x - 48) >> 3);
+                        }
+                    }
+                    x += 8;
+                    continue;
+                }
+                let y_flip = if map_data & 0x8000 != 0 { 7 } else { 0 };
+                let tile_base = (tile * 16 + (local_y ^ y_flip)) * 2;
+                let td = [
+                    self.sgb.char_ram[tile_base],
+                    self.sgb.char_ram[tile_base + 1],
+                    self.sgb.char_ram[tile_base + 0x10],
+                    self.sgb.char_ram[tile_base + 0x11],
+                ];
+                let base = y * stride + x;
+                let palette_base = ((map_data >> 10) & 7) as usize * 0x10;
+                let x_flip = if map_data & 0x4000 != 0 { 7 } else { 0 };
+                for i in (0..8).rev() {
+                    let sel = ((td[0] >> i) & 1) | (((td[1] >> i) & 1) << 1) | (((td[2] >> i) & 1) << 2) | (((td[3] >> i) & 1) << 3);
+                    self.output[(base + 7 - i) ^ x_flip] = self.palette[palette_base | sel as usize];
+                }
+                x += 8;
+            }
+        }
+    }
+
+    /// `GBVideoSoftwareRendererEnableSGBBorder`
+    pub fn enable_sgb_border(&mut self, enable: bool) {
+        if self.model & model::SGB != 0 {
+            if enable == self.sgb_borders {
+                return;
+            }
+            self.sgb_borders = enable;
+            self.update_size();
+            if self.sgb_borders && self.sgb.render_mode == 0 {
+                self.regenerate_sgb_border();
+            }
+        }
     }
 
     /// `GBVideoSoftwareRendererInit`
@@ -183,6 +284,8 @@ impl GbRenderer {
             *l = i as u8;
         }
         self.palette = [0; 192];
+        self.sgb_border_mask = [0; 18];
+        self.update_size();
     }
 
     /// `_clearScreen`
@@ -454,6 +557,11 @@ impl GbRenderer {
                     i += 1;
                 }
             }
+            sgb::ATRC_EN | sgb::MASK_EN => {
+                if self.sgb_borders && self.sgb.render_mode == 0 {
+                    self.regenerate_sgb_border();
+                }
+            }
             _ => {}
         }
     }
@@ -493,9 +601,14 @@ impl GbRenderer {
             self.palette[index + PAL_HIGHLIGHT] = color;
         }
 
-        if self.model & model::SGB != 0 && index == 0 && self.lcdc & LCDC_ENABLE != 0 && self.model & model::CGB == 0 {
-            for i in [0x04, 0x08, 0x0C, 0x40, 0x50, 0x60, 0x70] {
-                self.write_palette(i, value);
+        if self.model & model::SGB != 0 && index == 0 && self.lcdc & LCDC_ENABLE != 0 {
+            if self.model & model::CGB == 0 {
+                for i in [0x04, 0x08, 0x0C, 0x40, 0x50, 0x60, 0x70] {
+                    self.write_palette(i, value);
+                }
+            }
+            if self.sgb_borders && self.sgb.render_mode == 0 {
+                self.regenerate_sgb_border();
             }
         }
     }
@@ -591,7 +704,8 @@ impl GbRenderer {
             }
         }
 
-        let row_base = HORIZONTAL_PIXELS * y as usize;
+        let sgb_offset = if self.uses_borders() { self.width * 40 + 48 } else { 0 };
+        let row_base = self.width * y as usize + sgb_offset;
         let sgb_attrs = (self.model & (model::SGB | model::CGB)) == model::SGB;
         let attr = |r: &GbRenderer, x: i32| -> usize {
             if !sgb_attrs {
@@ -626,6 +740,7 @@ impl GbRenderer {
                         self.palette[p | self.lookup[(self.row[x as usize] & OBJ_PRIO_MASK) as usize] as usize];
                     x += 1;
                 }
+                self.draw_border_mask(row_base, start_x, end_x, y);
             }
             1 => {}
             2 => {
@@ -639,6 +754,49 @@ impl GbRenderer {
                     self.output[row_base + x as usize] = c;
                 }
             }
+        }
+    }
+
+    /// The SGB border tiles drawn over the Game Boy screen (end of `drawRange`, mode 0).
+    fn draw_border_mask(&mut self, row_base: usize, start_x: i32, end_x: i32, y: i32) {
+        let Some(&border_mask) = self.sgb_border_mask.get((y >> 3) as usize) else { return };
+        if border_mask == 0 || self.sgb.map_ram.len() < SGB_SIZE_MAP_RAM {
+            return;
+        }
+        let local_y = (y & 7) as usize;
+        let mut x = start_x;
+        while x < end_x {
+            if border_mask & (1 << (x >> 3)) == 0 {
+                x += 8;
+                continue;
+            }
+            let mo = (x as usize >> 2) + 12 + (y as usize & !7) * 8 + 320;
+            let map_data = self.sgb.map_ram[mo] as u16 | ((self.sgb.map_ram[mo + 1] as u16) << 8);
+            let tile = (map_data & 0x3FF) as usize;
+            if tile >= 0x100 {
+                x += 8;
+                continue;
+            }
+            let y_flip = if map_data & 0x8000 != 0 { 7 } else { 0 };
+            let tile_base = (tile * 16 + (local_y ^ y_flip)) * 2;
+            let td = [
+                self.sgb.char_ram[tile_base],
+                self.sgb.char_ram[tile_base + 1],
+                self.sgb.char_ram[tile_base + 0x10],
+                self.sgb.char_ram[tile_base + 0x11],
+            ];
+            let palette_base = ((map_data >> 10) & 7) as usize * 0x10;
+            let flip = if map_data & 0x4000 != 0 { 7 } else { 0 };
+            for i in (0..8).rev() {
+                let sel = ((td[0] >> i) & 1) | (((td[1] >> i) & 1) << 1) | (((td[2] >> i) & 1) << 2) | (((td[3] >> i) & 1) << 3);
+                if sel != 0 {
+                    let px = ((x as usize + 7 - i) ^ flip) + row_base;
+                    if let Some(o) = self.output.get_mut(px) {
+                        *o = self.palette[palette_base | sel as usize];
+                    }
+                }
+            }
+            x += 8;
         }
     }
 
@@ -695,9 +853,16 @@ impl GbRenderer {
                 sgb::PAL_SET | sgb::ATTR_SET => {
                     if self.sgb_packet[1] & 0x40 != 0 {
                         self.sgb.render_mode = 0;
+                        if self.sgb_borders {
+                            self.regenerate_sgb_border();
+                        }
                     }
                 }
                 sgb::PAL_TRN | sgb::CHR_TRN | sgb::PCT_TRN | sgb::ATRC_EN | sgb::MASK_EN | sgb::ATTR_TRN => {
+                    if self.sgb_command_header >> 3 != sgb::ATTR_TRN && self.sgb_borders && self.sgb.render_mode == 0 {
+                        // Make sure every buffer sees this if we're multibuffering
+                        self.regenerate_sgb_border();
+                    }
                     self.sgb_transfer += 1;
                     if self.sgb_transfer == 5 {
                         self.sgb_command_header = 0;

@@ -135,3 +135,109 @@ fn cgb_rom_runs_in_color_mode() {
     assert_eq!(dmg.model, mgba_core::gb::model::DMG);
     assert_eq!(dmg.cpu.a, 0x01);
 }
+
+/// A ROM of `banks` 16 KiB banks whose first byte of each bank holds its number.
+fn banked_rom(cart_type: u8, ram_size: u8, banks: usize) -> Vec<u8> {
+    let mut rom = make_rom(cart_type, ram_size, 0x00, &[0x18, 0xFE]);
+    rom.resize(banks * 0x4000, 0);
+    for b in 1..banks {
+        rom[b * 0x4000] = b as u8;
+    }
+    rom[0x148] = (banks / 2).trailing_zeros() as u8;
+    rom
+}
+
+#[test]
+fn wisdom_tree_switches_32k_banks() {
+    let mut rom = banked_rom(0x00, 0, 8);
+    // _isWisdomTree: blank title/header fields, checksum $E7 and the name in ROM
+    for b in &mut rom[0x134..0x14C] {
+        *b = 0;
+    }
+    rom[0x14D] = 0xE7;
+    rom[0x400..0x40B].copy_from_slice(b"WISDOM TREE");
+    rom[0x0000] = 0xAA;
+    let mut gb = Gb::new();
+    gb.load_rom(rom);
+    gb.reset();
+    assert_eq!(gb.memory.mbc_type, mbc::UNL_WISDOM_TREE);
+    gb.store8(0x0001, 0); // address bits select 32 KiB bank 1 -> banks 2 and 3
+    assert_eq!(gb.load8(0x0000), 2);
+    assert_eq!(gb.load8(0x4000), 3);
+}
+
+#[test]
+fn huc3_clock_counts_minutes_and_saves() {
+    let mut gb = Gb::new();
+    gb.rtc_fake_epoch_ms = Some(0);
+    gb.load_rom(banked_rom(0xFE, 0x02, 4));
+    gb.reset();
+    assert_eq!(gb.memory.mbc_type, mbc::HUC3);
+    // Pretend the clock was last latched 61 minutes before boot.
+    gb.memory.rtc_last_latch = -61 * 60;
+    let cmd = |gb: &mut Gb, v: u8| {
+        gb.store8(0x0000, 0x0B); // mode IN
+        gb.store8(0xA000, v);
+        gb.store8(0x0000, 0x0D); // mode COMMIT
+        gb.store8(0xA000, 0);
+    };
+    cmd(&mut gb, 0x60); // latch: copy the clock to registers 0..6
+    // read registers 0..2 (minutes, low nibble first) with auto-increment
+    cmd(&mut gb, 0x40);
+    cmd(&mut gb, 0x50);
+    let mut minutes = 0u32;
+    for i in 0..3 {
+        cmd(&mut gb, 0x10);
+        gb.store8(0x0000, 0x0C); // mode OUT
+        minutes |= ((gb.load8(0xA000) & 0xF) as u32) << (4 * i);
+    }
+    assert_eq!(minutes, 61);
+    let save = gb.savedata().unwrap();
+    assert_eq!(save.len(), 0x2000 + 0x88, "HuC-3 saves end with mGBA's 136-byte clock block");
+}
+
+#[test]
+fn tama5_ram_round_trips() {
+    let mut gb = Gb::new();
+    gb.load_rom(banked_rom(0xFD, 0x00, 4));
+    gb.reset();
+    assert_eq!(gb.memory.mbc_type, mbc::TAMA5);
+    let reg = |gb: &mut Gb, r: u8, v: u8| {
+        gb.store8(0xA001, r);
+        gb.store8(0xA000, v);
+    };
+    // write $5A to RAM address $13
+    reg(&mut gb, 4, 0xA); // WRITE_LO
+    reg(&mut gb, 5, 0x5); // WRITE_HI
+    reg(&mut gb, 6, 0x1); // ADDR_HI: RAM write, address bit 4
+    reg(&mut gb, 7, 0x3); // ADDR_LO: commit
+    assert_eq!(gb.memory.sram[0x13], 0x5A);
+    // read it back
+    reg(&mut gb, 6, 0x3); // ADDR_HI: RAM read, address bit 4
+    reg(&mut gb, 7, 0x3);
+    gb.store8(0xA001, 0xC); // READ_LO
+    let lo = gb.load8(0xA000) & 0xF;
+    gb.store8(0xA001, 0xD); // READ_HI
+    let hi = gb.load8(0xA000) & 0xF;
+    assert_eq!((hi << 4) | lo, 0x5A);
+    assert_eq!(gb.savedata().unwrap().len(), 0x20 + 40, "TAMA5 saves end with mGBA's 40-byte clock block");
+}
+
+#[test]
+fn pocket_camera_captures_from_image() {
+    let mut gb = Gb::new();
+    gb.load_rom(banked_rom(0xFC, 0x04, 4));
+    gb.reset();
+    assert_eq!(gb.memory.mbc_type, mbc::POCKETCAM);
+    gb.camera_image = Some(vec![0; 128 * 112]); // all black
+    gb.store8(0x0000, 0x0A);
+    gb.store8(0x4000, 0x10); // camera registers
+    gb.store8(0xA002, 0x01); // exposure
+    gb.store8(0xA003, 0x00);
+    for i in 0..48 {
+        gb.store8(0xA006 + i, 0x80); // dither thresholds
+    }
+    gb.store8(0xA000, 0x01); // capture
+    // Black pixels fall below every threshold: color 3 (both bitplanes set).
+    assert_eq!(&gb.memory.sram[0x100..0x104], &[0xFF, 0xFF, 0xFF, 0xFF]);
+}

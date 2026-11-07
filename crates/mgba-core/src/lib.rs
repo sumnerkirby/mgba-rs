@@ -5,6 +5,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 pub mod arm;
+pub mod cheats;
 pub mod gb;
 pub mod gba;
 pub mod sm83;

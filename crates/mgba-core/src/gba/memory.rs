@@ -1210,3 +1210,44 @@ fn savedata_settle_cycles() -> i32 {
 }
 
 use super::savedata;
+
+impl crate::cheats::CheatBus for Gba {
+    fn bus_read(&mut self, address: u32, width: i32) -> u32 {
+        match width {
+            1 => self.mem_load8(address, None),
+            2 => self.mem_load16(address, None),
+            _ => self.mem_load32(address, None),
+        }
+    }
+    fn bus_write(&mut self, address: u32, width: i32, value: u32) {
+        match width {
+            1 => self.mem_store8(address, value as u8, None),
+            2 => self.mem_store16(address, value as u16, None),
+            _ => self.mem_store32(address, value, None),
+        }
+    }
+    fn raw_read(&mut self, address: u32, _segment: i32, width: i32) -> u32 {
+        (0..width.max(1) as u32).fold(0, |acc, i| acc | (self.view8(address.wrapping_add(i)) as u32) << (8 * i))
+    }
+    /// `GBAPatch8/16/32`: ROM writes change the loaded image; other regions
+    /// are written like a normal store.
+    fn raw_write(&mut self, address: u32, _segment: i32, width: i32, value: u32) {
+        if (REGION_ROM0..=REGION_ROM2_EX).contains(&(address >> BASE_OFFSET)) {
+            if std::sync::Arc::get_mut(&mut self.memory.rom).is_none() {
+                self.memory.rom = std::sync::Arc::from(self.memory.rom.to_vec());
+            }
+            let rom = std::sync::Arc::get_mut(&mut self.memory.rom).unwrap();
+            for i in 0..width.max(1) as u32 {
+                let off = (address.wrapping_add(i) & (SIZE_ROM0 - 1)) as usize;
+                if let Some(b) = rom.get_mut(off) {
+                    *b = (value >> (8 * i)) as u8;
+                }
+            }
+        } else {
+            crate::cheats::CheatBus::bus_write(self, address, width, value);
+        }
+    }
+    fn max_segment(&self, _address: u32) -> Option<i32> {
+        Some(0)
+    }
+}

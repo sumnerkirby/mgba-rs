@@ -1,7 +1,7 @@
 //! Runs a Game Boy ROM headlessly and writes the last frame as a PNG.
 //! Handy for checking a cinema test by eye or timing the core.
 //!
-//! Usage: cargo run --release -p mgba-core --example gb -- <rom> <frames> [out.png] [--model CGB]
+//! Usage: cargo run --release -p mgba-core --example gb -- <rom> <frames> [out.png] [--model CGB] [--no-borders]
 
 use std::time::Instant;
 
@@ -24,6 +24,9 @@ fn main() {
         gb.model_config.cgb_hybrid = Some(m);
         gb.model_config.sgb = Some(m);
     }
+    if args.iter().any(|a| a == "--no-borders") {
+        gb.video.sgb_borders = false;
+    }
     gb.load_rom(std::fs::read(&args[0]).expect("read ROM"));
     gb.reset();
     let start = Instant::now();
@@ -43,7 +46,8 @@ fn main() {
     );
     if let Some(path) = out {
         let file = std::fs::File::create(&path).unwrap();
-        let mut enc = png::Encoder::new(file, 160, 144);
+        let (w, h) = gb.video_size();
+        let mut enc = png::Encoder::new(file, w as u32, h as u32);
         enc.set_color(png::ColorType::Rgb);
         let mut w = enc.write_header().unwrap();
         let data: Vec<u8> = gb.framebuffer().iter().flat_map(|&p| [p as u8, (p >> 8) as u8, (p >> 16) as u8]).collect();

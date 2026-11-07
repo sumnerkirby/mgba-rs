@@ -2,14 +2,14 @@
 // Rust port of mGBA's Game Boy memory bank controllers
 // (src/gb/mbc.c, src/gb/mbc/mbc.c, src/gb/mbc/licensed.c).
 //
-// Not ported yet: HuC-3, TAMA5, the Pocket Camera and the unlicensed mappers
-// (src/gb/mbc/huc-3.c, tama5.c, pocket-cam.c, unlicensed.c). Carts using them
-// fall back to MBC5 behavior, as mGBA does for unknown types.
+// HuC-3, TAMA5, the Pocket Camera and the unlicensed mappers live in
+// mbc_extra.rs. GBX files and their mapper variables aren't supported.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use super::mbc_extra::*;
 use super::memory::*;
 use super::{crc32, glog, Gb, LogLevel};
 
@@ -29,7 +29,18 @@ pub const TAMA5: i32 = 0x14;
 pub const M161: i32 = 0x15;
 pub const MBC3_RTC: i32 = 0x103;
 pub const MBC5_RUMBLE: i32 = 0x105;
+pub const UNL_WISDOM_TREE: i32 = 0x200;
+pub const UNL_PKJD: i32 = 0x203;
+pub const UNL_NT_OLD_1: i32 = 0x210;
+pub const UNL_NT_OLD_2: i32 = 0x211;
 pub const UNL_NT_NEW: i32 = 0x212;
+pub const UNL_BBD: i32 = 0x220;
+pub const UNL_HITEK: i32 = 0x221;
+pub const UNL_LI_CHENG: i32 = 0x222;
+pub const UNL_GGB81: i32 = 0x223;
+pub const UNL_SACHEN_MMC1: i32 = 0x230;
+pub const UNL_SACHEN_MMC2: i32 = 0x231;
+pub const UNL_SINTAX: i32 = 0x240;
 
 const LOGO_HASH: u32 = 0x46195417;
 
@@ -101,6 +112,14 @@ pub struct MbcState {
     pub mmm01: Mmm01State,
     pub m161: M161State,
     pub nt_new: NtNewState,
+    pub huc3: HuC3State,
+    pub tama5: Tama5State,
+    pub pocket_cam: PocketCamState,
+    pub pkjd: PkjdState,
+    pub nt_old: NtOldState,
+    pub bbd: BbdState,
+    pub sachen: SachenState,
+    pub sintax: SintaxState,
 }
 
 fn to_pow2(x: usize) -> usize {
@@ -311,6 +330,9 @@ impl Gb {
             };
 
             if self.memory.mbc_type == MBC_AUTODETECT {
+                self.memory.mbc_type = detect_unl_mbc(&rom, rom_size);
+            }
+            if self.memory.mbc_type == MBC_AUTODETECT {
                 self.memory.mbc_type = match cart_type {
                     0 | 8 | 9 => MBC_NONE,
                     1..=3 => MBC1,
@@ -368,15 +390,53 @@ impl Gb {
             MBC3_RTC => {
                 mem.rtc_regs = [0; 5];
             }
+            HUC3 => {
+                mem.has_mbc_read = true;
+            }
             TAMA5 => {
+                mem.has_mbc_read = true;
+                mem.mbc_state.tama5.rtc_alarm_page[RTC_PAGE] = 1;
+                mem.mbc_state.tama5.rtc_free_page0[RTC_PAGE] = 2;
+                mem.mbc_state.tama5.rtc_free_page1[RTC_PAGE] = 3;
                 sram_size = 0x20;
             }
             POCKETCAM => {
+                mem.has_mbc_read = true;
                 if sram_size == 0 {
-                    sram_size = SIZE_EXTERNAL_RAM;
+                    sram_size = SIZE_EXTERNAL_RAM; // Force minimum size for convenience
                 }
             }
-            MBC_NONE | MBC3 | MBC5 | MBC5_RUMBLE | MMM01 | HUC1 | HUC3 | M161 => {}
+            UNL_PKJD => {
+                mem.has_mbc_read = true;
+            }
+            UNL_BBD | UNL_GGB81 => {
+                mem.has_mbc_read = true;
+                mem.mbc_read_bank1 = true;
+            }
+            UNL_HITEK => {
+                mem.has_mbc_read = true;
+                mem.mbc_state.bbd.data_swap_mode = 7;
+                mem.mbc_state.bbd.bank_swap_mode = 7;
+                mem.mbc_read_bank1 = true;
+            }
+            UNL_SACHEN_MMC1 => {
+                mem.has_mbc_read = true;
+                mem.mbc_read_bank0 = true;
+                mem.mbc_read_bank1 = true;
+            }
+            UNL_SACHEN_MMC2 => {
+                mem.has_mbc_read = true;
+                mem.mbc_read_bank0 = true;
+                mem.mbc_read_bank1 = true;
+                mem.mbc_read_high = true;
+                mem.mbc_write_high = true;
+            }
+            UNL_SINTAX => {
+                mem.has_mbc_read = true;
+                mem.mbc_read_bank1 = true;
+            }
+            MBC_NONE | MBC3 | MBC5 | MBC5_RUMBLE | MMM01 | HUC1 | M161 | UNL_WISDOM_TREE | UNL_NT_OLD_1
+            | UNL_NT_OLD_2 | UNL_NT_NEW | UNL_LI_CHENG => {}
             _ => {
                 glog!(self, LogLevel::Warn, "Unknown MBC type: {:02X}", cart_type);
             }
@@ -395,10 +455,15 @@ impl Gb {
 
         self.resize_sram(sram_size);
 
-        if self.memory.mbc_type == MBC3_RTC && !self.rtc_file.is_empty() {
-            // GBMBCRTCRead
+        // GBMBCRTCRead / GBMBCHuC3Read / GBMBCTAMA5Read from the save file's suffix
+        if !self.rtc_file.is_empty() {
             let file = std::mem::take(&mut self.rtc_file);
-            self.rtc_load_suffix(&file);
+            match self.memory.mbc_type {
+                MBC3_RTC => self.rtc_load_suffix(&file),
+                HUC3 => self.huc3_load_suffix(&file),
+                TAMA5 => self.tama5_load_suffix(&file),
+                _ => {}
+            }
             self.rtc_file = file;
         }
     }
@@ -463,6 +528,20 @@ impl Gb {
                     glog!(self, LogLevel::GameError, "Wrote to invalid MBC");
                 }
             }
+            HUC3 => self.huc3_write(address, value),
+            TAMA5 => self.tama5_write(address, value),
+            POCKETCAM => self.pocket_cam_write(address, value),
+            UNL_WISDOM_TREE => self.wisdom_tree_write(address, value),
+            UNL_PKJD => self.pkjd_write(address, value),
+            UNL_NT_OLD_1 => self.nt_old_write(address, value, false),
+            UNL_NT_OLD_2 => self.nt_old_write(address, value, true),
+            UNL_NT_NEW => self.nt_new_write(address, value),
+            UNL_BBD => self.bbd_write(address, value),
+            UNL_HITEK => self.hitek_write(address, value),
+            UNL_LI_CHENG => self.li_cheng_write(address, value),
+            UNL_GGB81 => self.ggb81_write(address, value),
+            UNL_SACHEN_MMC1 | UNL_SACHEN_MMC2 => self.sachen_write(address, value),
+            UNL_SINTAX => self.sintax_write(address, value),
             MBC1 => self.mbc1_write(address, value),
             MBC2 => self.mbc2_write(address, value),
             MBC3 | MBC3_RTC => self.mbc3_write(address, value),
@@ -500,6 +579,16 @@ impl Gb {
                 }
             }
             MBC7 => self.mbc7_read(address),
+            HUC3 => self.huc3_read(address),
+            TAMA5 => self.tama5_read(address),
+            POCKETCAM => self.pocket_cam_read(address),
+            UNL_PKJD => self.pkjd_read(address),
+            UNL_BBD => self.reordered_read(address, 0),
+            UNL_HITEK => self.reordered_read(address, 1),
+            UNL_GGB81 => self.reordered_read(address, 2),
+            UNL_SACHEN_MMC1 => self.sachen_mmc1_read(address),
+            UNL_SACHEN_MMC2 => self.sachen_mmc2_read(address),
+            UNL_SINTAX => self.sintax_read(address),
             _ => 0xFF,
         }
     }
@@ -584,7 +673,7 @@ impl Gb {
     }
 
     /// `_GBMBC3`
-    fn mbc3_write(&mut self, address: u16, value: u8) {
+    pub(crate) fn mbc3_write(&mut self, address: u16, value: u8) {
         let mut bank = value as i32;
         match address >> 13 {
             0x0 => {
@@ -630,7 +719,7 @@ impl Gb {
     }
 
     /// `_GBMBC5`
-    fn mbc5_write(&mut self, address: u16, value: u8) {
+    pub(crate) fn mbc5_write(&mut self, address: u16, value: u8) {
         match address >> 12 {
             0x0 | 0x1 => match value {
                 0 => self.memory.sram_access = false,
@@ -974,6 +1063,48 @@ impl Gb {
     }
 }
 
+/// `_detectUnlMBC`
+fn detect_unl_mbc(mem: &[u8], size: usize) -> i32 {
+    if mem.len() < 0x8000 {
+        return MBC_AUTODETECT;
+    }
+    let cart_type = mem[0x100 + cart::TYPE];
+    if cart_type == 0 && is_wisdom_tree(mem, size) {
+        return UNL_WISDOM_TREE;
+    }
+    match crc32(&mem[0x184..0x184 + 0x30]) {
+        0x4fdab691 => return UNL_HITEK,
+        0xc7d8c1df | 0x6d1ea662 => {
+            // Garou; make sure we're not using a "fixed" version
+            if mem[0x7FFF] != 0x01 {
+                return UNL_BBD;
+            }
+        }
+        0x79f34594 | 0x7e8c539b => return UNL_GGB81, // DATA. / TD-SOFT
+        0x20d092e2 | 0xd2b57657 => {
+            if cart_type == 0x01 {
+                return UNL_LI_CHENG;
+            }
+            if 0x8000usize.checked_shl(mem[0x100 + cart::ROM_SIZE] as u32).unwrap_or(0) != size {
+                return UNL_LI_CHENG;
+            }
+        }
+        0x6c1dcf2d | 0x99e3449d => {
+            if mem[0x7FFF] != 0x01 {
+                return UNL_SINTAX;
+            }
+        }
+        _ => {}
+    }
+    if mem[0x104] == 0xCE && mem[0x144] == 0xED && mem[0x114] == 0x66 {
+        return UNL_SACHEN_MMC1;
+    }
+    if mem[0x184] == 0xCE && mem[0x1C4] == 0xED && mem[0x194] == 0x66 {
+        return UNL_SACHEN_MMC2;
+    }
+    MBC_AUTODETECT
+}
+
 /// Human-readable name of an MBC type.
 pub fn name(mbc: i32) -> &'static str {
     match mbc {
@@ -988,10 +1119,22 @@ pub fn name(mbc: i32) -> &'static str {
         MBC7 => "MBC7",
         MMM01 => "MMM01",
         HUC1 => "HuC-1",
-        HUC3 => "HuC-3 (unsupported)",
-        POCKETCAM => "Pocket Camera (unsupported)",
-        TAMA5 => "TAMA5 (unsupported)",
+        HUC3 => "HuC-3",
+        POCKETCAM => "Pocket Camera",
+        TAMA5 => "TAMA5",
         M161 => "M161",
+        UNL_WISDOM_TREE => "Wisdom Tree",
+        UNL_PKJD => "PKJD",
+        UNL_NT_OLD_1 => "NT (old 1)",
+        UNL_NT_OLD_2 => "NT (old 2)",
+        UNL_NT_NEW => "NT (new)",
+        UNL_BBD => "BBD",
+        UNL_HITEK => "Hitek",
+        UNL_LI_CHENG => "Li Cheng",
+        UNL_GGB81 => "GGB-81",
+        UNL_SACHEN_MMC1 => "Sachen MMC1",
+        UNL_SACHEN_MMC2 => "Sachen MMC2",
+        UNL_SINTAX => "Sintax",
         _ => "Unknown",
     }
 }

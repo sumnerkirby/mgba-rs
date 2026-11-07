@@ -7,7 +7,7 @@
 
 use super::memory::{SIZE_OAM, SIZE_VRAM, SIZE_VRAM_BANK0};
 use super::renderer::{SGB_SIZE_ATF_RAM, SGB_SIZE_CHAR_RAM, SGB_SIZE_MAP_RAM, SGB_SIZE_PAL_RAM};
-use super::{io, model, sgb, Gb, GbEvent, IRQ_LCDSTAT, IRQ_VBLANK};
+use super::{io, model, sgb, sgb_border, Gb, GbEvent, IRQ_LCDSTAT, IRQ_VBLANK};
 use crate::sm83::CORE_FETCH;
 
 pub const HORIZONTAL_PIXELS: usize = 160;
@@ -122,8 +122,7 @@ impl GbVideo {
             sgb_packet_buffer: [0; 128],
             dmg_palette,
             palette: [0; 64],
-            // mGBA defaults to borders on; this port doesn't render them.
-            sgb_borders: false,
+            sgb_borders: true,
             frame_counter: 0,
             frameskip: 0,
             frameskip_counter: 0,
@@ -179,11 +178,15 @@ impl Gb {
         v.oam = [0; SIZE_OAM];
         v.palette = [0; 64];
 
-        // SGB border graphics aren't rendered, so the default border data isn't loaded.
         let sgb = &mut self.renderer.sgb;
         if self.model & model::SGB != 0 {
             sgb.char_ram = vec![0; SGB_SIZE_CHAR_RAM];
+            sgb.char_ram[..sgb_border::DEFAULT_BORDER_CHARDATA.len()].copy_from_slice(&sgb_border::DEFAULT_BORDER_CHARDATA);
             sgb.map_ram = vec![0; SGB_SIZE_MAP_RAM];
+            sgb.map_ram[..sgb_border::DEFAULT_BORDER_TILEMAP.len()].copy_from_slice(&sgb_border::DEFAULT_BORDER_TILEMAP);
+            for (i, c) in sgb_border::DEFAULT_BORDER_PALETTE.iter().enumerate() {
+                sgb.map_ram[0x800 + i * 2..0x802 + i * 2].copy_from_slice(&c.to_le_bytes());
+            }
             sgb.pal_ram = vec![0; SGB_SIZE_PAL_RAM];
             sgb.attribute_files = vec![0; SGB_SIZE_ATF_RAM];
             sgb.attributes = vec![0; 90 * 45];

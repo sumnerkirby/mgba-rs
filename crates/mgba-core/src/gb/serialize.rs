@@ -42,6 +42,7 @@ impl Gb {
         // Carry over what isn't part of the state.
         new.memory.rom = self.memory.rom.clone();
         new.bios = self.bios.take();
+        new.cheats = std::mem::take(&mut self.cheats);
         new.log_enabled = self.log_enabled;
         let audio_buffer = std::mem::take(&mut self.audio.buffer);
         *self = new;

@@ -7,6 +7,8 @@
 mod app;
 mod audio;
 mod core;
+mod gamepad;
+mod rewind;
 
 use std::path::PathBuf;
 

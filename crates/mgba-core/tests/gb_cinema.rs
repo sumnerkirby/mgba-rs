@@ -97,8 +97,8 @@ fn rom_path(dir: &Path) -> Option<PathBuf> {
 
 fn frame_matches(gb: &Gb, expected: &(u32, u32, Vec<u8>)) -> Result<(), String> {
     let (w, h, px) = expected;
-    if (*w as usize, *h as usize) != (mgba_core::gb::VIDEO_HORIZONTAL_PIXELS, mgba_core::gb::VIDEO_VERTICAL_PIXELS) {
-        return Err(format!("baseline is {w}x{h}"));
+    if (*w as usize, *h as usize) != gb.video_size() {
+        return Err(format!("baseline is {w}x{h}, output is {:?}", gb.video_size()));
     }
     let bad = gb
         .framebuffer()
@@ -140,6 +140,9 @@ fn run_test(root: &Path, dir: &Path) -> Outcome {
     gb.model_config.cgb = pick("cgb.model");
     gb.model_config.cgb_hybrid = pick("cgb.hybridModel");
     gb.model_config.cgb_sgb = pick("cgb.sgbModel");
+    if let Some(v) = port.get("sgb.borders") {
+        gb.video.sgb_borders = !matches!(v.as_str(), "0" | "false");
+    }
     gb.rtc_fake_epoch_ms = Some(1_200_000_000);
     gb.load_rom(std::fs::read(rom_path(dir).unwrap()).unwrap());
     gb.reset();

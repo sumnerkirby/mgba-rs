@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::{AudioOut, Resampler};
 use crate::core::{detect_platform, Core, Platform};
+use crate::gamepad::{self, Gamepads};
+use crate::rewind::{Rewind, Snapshot};
 
 /// Screen size shown before a game is loaded (the GBA's).
 const GBA_W: usize = 240;
@@ -57,7 +59,7 @@ impl Button {
         Button::Select,
     ];
 
-    fn bit(self) -> u16 {
+    pub fn bit(self) -> u16 {
         match self {
             Button::A => keys::A,
             Button::B => keys::B,
@@ -103,11 +105,18 @@ pub struct Settings {
     pub gbc_bios_path: Option<PathBuf>,
     /// Forced Game Boy model, `model::AUTODETECT` to follow the cartridge.
     pub gb_model: u8,
+    /// Super Game Boy borders (mGBA's `sgb.borders`)
+    pub sgb_borders: bool,
     pub skip_bios: bool,
     pub keymap: Vec<(Button, Key)>,
+    /// Controller bindings: button -> Linux input event code.
+    pub pad_map: Vec<(Button, u16)>,
     pub recent_roms: Vec<PathBuf>,
     pub fast_forward_multiplier: u32,
     pub show_fps: bool,
+    pub rewind_enabled: bool,
+    /// Seconds of history kept for rewinding.
+    pub rewind_seconds: u32,
     pub pause_when_unfocused: bool,
 }
 
@@ -123,6 +132,7 @@ impl Default for Settings {
             gb_bios_path: None,
             gbc_bios_path: None,
             gb_model: model::AUTODETECT,
+            sgb_borders: true,
             skip_bios: false,
             // mGBA's default keyboard layout
             keymap: vec![
@@ -137,9 +147,12 @@ impl Default for Settings {
                 (Button::Start, Key::Enter),
                 (Button::Select, Key::Backspace),
             ],
+            pad_map: gamepad::default_mapping(),
             recent_roms: Vec::new(),
             fast_forward_multiplier: 4,
             show_fps: true,
+            rewind_enabled: true,
+            rewind_seconds: 30,
             pause_when_unfocused: false,
         }
     }
@@ -166,6 +179,23 @@ struct Emulator {
 impl Emulator {
     fn state_path(&self, slot: u32) -> PathBuf {
         self.rom_path.with_extension(format!("ss{slot}"))
+    }
+
+    /// mGBA's cheats file for this game (`<rom>.cheats`).
+    fn cheats_path(&self) -> PathBuf {
+        self.rom_path.with_extension("cheats")
+    }
+
+    fn write_cheats(&self) -> std::io::Result<()> {
+        let path = self.cheats_path();
+        let cheats = self.core.cheats();
+        if cheats.sets.is_empty() {
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+            return Ok(());
+        }
+        std::fs::write(path, cheats.save_file())
     }
 
     fn write_save(&mut self) -> std::io::Result<bool> {
@@ -211,7 +241,19 @@ pub struct App {
     error: Option<String>,
     show_keymap: bool,
     rebinding: Option<Button>,
+    rebinding_pad: Option<Button>,
+    gamepads: Gamepads,
+    rewind: Rewind,
+    rewind_tick: u32,
+    rewinding: bool,
+    /// Frame to show instead of the core's (the frame restored by rewind).
+    shown_frame: Option<Vec<u32>>,
+    pad_pressed: Vec<u16>,
     show_about: bool,
+    show_cheats: bool,
+    cheat_name: String,
+    cheat_codes: String,
+    cheat_error: Option<String>,
     show_log: bool,
     log_lines: Vec<String>,
     fullscreen: bool,
@@ -240,7 +282,18 @@ impl App {
             error: None,
             show_keymap: false,
             rebinding: None,
+            rebinding_pad: None,
+            gamepads: Gamepads::new(),
+            rewind: Rewind::new(1),
+            rewind_tick: 0,
+            rewinding: false,
+            shown_frame: None,
+            pad_pressed: Vec::new(),
             show_about: false,
+            show_cheats: false,
+            cheat_name: String::new(),
+            cheat_codes: String::new(),
+            cheat_error: None,
             show_log: false,
             log_lines: Vec::new(),
             fullscreen: false,
@@ -288,7 +341,13 @@ impl App {
             title = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("mGBA-rs — {title}")));
-        self.emu = Some(Emulator { core, rom_path: path.to_path_buf(), save_path, title: title.clone() });
+        let mut emu = Emulator { core, rom_path: path.to_path_buf(), save_path, title: title.clone() };
+        if let Ok(text) = std::fs::read_to_string(emu.cheats_path()) {
+            emu.core.load_cheats(&text);
+        }
+        self.emu = Some(emu);
+        self.rewind.clear();
+        self.shown_frame = None;
         self.paused = false;
         self.acc = 0.0;
         self.last_tick = None;
@@ -330,6 +389,7 @@ impl App {
     fn make_gb(&mut self, data: Vec<u8>, save: Option<&[u8]>) -> Option<Core> {
         let mut gb = Gb::new();
         gb.log_enabled = self.show_log;
+        gb.video.sgb_borders = self.settings.sgb_borders;
         let m = self.settings.gb_model;
         if m != model::AUTODETECT {
             let c = &mut gb.model_config;
@@ -477,17 +537,30 @@ impl App {
     fn reset(&mut self) {
         if let Some(emu) = &mut self.emu {
             emu.core.reset();
+            self.shown_frame = None;
             self.set_status("Reset");
         }
     }
 
     // ----- Emulation -----
 
-    fn read_keys(&self, ctx: &egui::Context) -> u16 {
-        if ctx.memory(|m| m.focused().is_some()) || self.rebinding.is_some() {
+    fn read_keys(&mut self, ctx: &egui::Context) -> u16 {
+        let (pressed, newly) = self.gamepads.poll();
+        self.pad_pressed = pressed;
+        if let (Some(button), Some(c)) = (self.rebinding_pad, newly) {
+            self.settings.pad_map.retain(|(b, _)| *b != button);
+            self.settings.pad_map.push((button, c));
+            self.rebinding_pad = None;
             return 0;
         }
-        ctx.input(|i| {
+        if self.rebinding.is_some() || self.rebinding_pad.is_some() {
+            return 0;
+        }
+        let pad = Gamepads::keys(&self.pad_pressed, &self.settings.pad_map);
+        if ctx.memory(|m| m.focused().is_some()) {
+            return pad;
+        }
+        pad | ctx.input(|i| {
             self.settings
                 .keymap
                 .iter()
@@ -503,13 +576,45 @@ impl App {
 
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         let running = self.emu.is_some() && !self.paused && !(self.settings.pause_when_unfocused && !focused);
+        // Poll input even while stopped so controller rebinding works.
+        let keys = self.read_keys(ctx);
         if !running {
             self.acc = 0.0;
+            if self.rebinding_pad.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
             return;
         }
 
+        let rewind_held = self.settings.rewind_enabled
+            && self.rebinding.is_none()
+            && ctx.memory(|m| m.focused().is_none())
+            && ctx.input(|i| i.key_down(Key::Backtick));
+        if rewind_held {
+            self.rewinding = true;
+            self.acc = 0.0;
+            let emu = self.emu.as_mut().unwrap();
+            // Step back one snapshot per displayed frame.
+            if let Some(snap) = self.rewind.pop() {
+                if emu.core.load_state(&snap.state).is_ok() {
+                    self.shown_frame = Some(snap.frame);
+                }
+                if self.rewind.len() == 0 {
+                    // Keep the oldest moment so rewinding again stays there.
+                    self.rewind.push(Snapshot { state: emu.core.save_state(), frame: self.shown_frame.clone().unwrap_or_default() });
+                }
+            }
+            if let Some(a) = &self.audio {
+                a.clear();
+            }
+            return;
+        }
+        if self.rewinding {
+            self.rewinding = false;
+            self.last_tick = Some(Instant::now());
+        }
+
         let fast_forward = self.fast_forward_toggle || ctx.input(|i| i.key_down(Key::Tab));
-        let keys = self.read_keys(ctx);
         let fps_target = self.emu.as_ref().map(|e| e.core.fps()).unwrap_or(60.0);
 
         self.acc += dt;
@@ -534,8 +639,22 @@ impl App {
         let emu = self.emu.as_mut().unwrap();
         emu.core.set_keys(keys);
         self.audio_scratch.clear();
+        // One snapshot every other frame, like mGBA's rewind interval setting.
+        const REWIND_INTERVAL: u32 = 2;
+        let capacity = (self.settings.rewind_seconds as f64 * fps_target / REWIND_INTERVAL as f64) as usize;
+        self.rewind.capacity = capacity.max(1);
+        if frames > 0 {
+            self.shown_frame = None;
+        }
         for _ in 0..frames {
             emu.core.run_frame();
+            if self.settings.rewind_enabled {
+                self.rewind_tick += 1;
+                if self.rewind_tick >= REWIND_INTERVAL {
+                    self.rewind_tick = 0;
+                    self.rewind.push(Snapshot { state: emu.core.save_state(), frame: emu.core.framebuffer().to_vec() });
+                }
+            }
             emu.core.drain_audio(&mut self.audio_scratch);
             if fast_forward {
                 self.audio_scratch.clear();
@@ -572,10 +691,14 @@ impl App {
 
     fn update_texture(&mut self, ctx: &egui::Context) {
         let (size, pixels): ([usize; 2], Vec<Color32>) = match &self.emu {
-            Some(emu) => (
-                emu.core.screen_size(),
-                emu.core.framebuffer().iter().map(|&p| Color32::from_rgb(p as u8, (p >> 8) as u8, (p >> 16) as u8)).collect(),
-            ),
+            Some(emu) => {
+                let size = emu.core.screen_size();
+                let src: &[u32] = match &self.shown_frame {
+                    Some(f) if f.len() == size[0] * size[1] => f,
+                    _ => emu.core.framebuffer(),
+                };
+                (size, src.iter().map(|&p| Color32::from_rgb(p as u8, (p >> 8) as u8, (p >> 16) as u8)).collect())
+            }
             None => ([GBA_W, GBA_H], vec![Color32::BLACK; GBA_W * GBA_H]),
         };
         let image = ColorImage::new(size, pixels);
@@ -725,6 +848,18 @@ impl App {
                     ui.add(egui::Slider::new(&mut self.settings.fast_forward_multiplier, 2..=10).suffix("×"));
                 });
                 ui.checkbox(&mut self.settings.pause_when_unfocused, "Pause when window is inactive");
+                if ui.checkbox(&mut self.settings.rewind_enabled, "Rewind (hold `)").changed() && !self.settings.rewind_enabled {
+                    self.rewind.clear();
+                }
+                ui.add_enabled_ui(self.settings.rewind_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Rewind history:");
+                        ui.add(egui::Slider::new(&mut self.settings.rewind_seconds, 5..=120).suffix(" s"));
+                    });
+                    if self.emu.is_some() {
+                        ui.label(egui::RichText::new(format!("{:.1} MB in use", self.rewind.memory() as f64 / 1e6)).small());
+                    }
+                });
                 ui.separator();
                 ui.label("GBA BIOS");
                 let bios = self.settings.bios_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Built-in (HLE)".into());
@@ -787,6 +922,11 @@ impl App {
                     }
                 });
                 ui.checkbox(&mut self.settings.integer_scaling, "Integer scaling");
+                if ui.checkbox(&mut self.settings.sgb_borders, "Super Game Boy borders").changed() {
+                    if let Some(Emulator { core: Core::Gb(g), .. }) = &mut self.emu {
+                        g.set_sgb_borders(self.settings.sgb_borders);
+                    }
+                }
                 ui.checkbox(&mut self.settings.smooth, "Bilinear filtering");
                 if ui.add(egui::Button::new(if self.fullscreen { "Exit fullscreen" } else { "Fullscreen" }).shortcut_text("F11")).clicked() {
                     self.fullscreen = !self.fullscreen;
@@ -874,6 +1014,10 @@ impl App {
                     self.show_keymap = true;
                     ui.close();
                 }
+                if ui.add_enabled(self.emu.is_some(), egui::Button::new("Cheats…")).clicked() {
+                    self.show_cheats = true;
+                    ui.close();
+                }
                 if ui.checkbox(&mut self.show_log, "Show emulator log").changed() {
                     if let Some(emu) = &mut self.emu {
                         emu.core.set_log_enabled(self.show_log);
@@ -903,6 +1047,15 @@ impl App {
         let rect = egui::Rect::from_center_size(available.center(), size);
         if self.emu.is_some() {
             ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            if self.rewinding {
+                ui.painter().text(
+                    rect.left_top() + egui::vec2(8.0, 6.0),
+                    egui::Align2::LEFT_TOP,
+                    "◀◀ Rewinding",
+                    egui::FontId::proportional(16.0),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 220),
+                );
+            }
             if self.paused {
                 ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(110));
                 ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Paused", egui::FontId::proportional(28.0), Color32::WHITE);
@@ -938,11 +1091,101 @@ impl App {
         });
     }
 
+    fn cheats_window(&mut self, ctx: &egui::Context) {
+        if !self.show_cheats {
+            return;
+        }
+        let Some(emu) = &mut self.emu else {
+            self.show_cheats = false;
+            return;
+        };
+        let mut open = true;
+        let mut changed = false;
+        let mut remove = None;
+        egui::Window::new("Cheats").open(&mut open).default_size([420.0, 360.0]).show(ctx, |ui| {
+            let sets = &mut emu.core.cheats_mut().sets;
+            if sets.is_empty() {
+                ui.label("No cheats for this game yet.");
+            }
+            egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                for (i, set) in sets.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        let name = if set.name.is_empty() { "(unnamed)".to_string() } else { set.name.clone() };
+                        if ui.checkbox(&mut set.enabled, name).changed() {
+                            changed = true;
+                        }
+                        ui.label(egui::RichText::new(format!("{} line(s)", set.lines.len())).small().weak());
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    })
+                    .response
+                    .on_hover_text(set.lines.join("\n"));
+                }
+            });
+            ui.separator();
+            ui.label("Add cheat");
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut self.cheat_name);
+            });
+            ui.add(
+                egui::TextEdit::multiline(&mut self.cheat_codes)
+                    .hint_text("One code per line: GameShark, Action Replay, CodeBreaker, Game Genie or VBA format")
+                    .desired_rows(5)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY),
+            );
+            if ui.button("Add").clicked() && !self.cheat_codes.trim().is_empty() {
+                let mut set = emu.core.new_cheat_set(self.cheat_name.trim());
+                let bad: Vec<String> = self
+                    .cheat_codes
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .filter(|l| !set.add_line(l))
+                    .map(str::to_string)
+                    .collect();
+                if set.lines.is_empty() {
+                    self.cheat_error = Some("None of those lines are codes this system understands.".into());
+                } else {
+                    self.cheat_error = (!bad.is_empty()).then(|| format!("Skipped unrecognized line(s): {}", bad.join(", ")));
+                    emu.core.cheats_mut().sets.push(set);
+                    self.cheat_name.clear();
+                    self.cheat_codes.clear();
+                    changed = true;
+                }
+            }
+            if let Some(err) = &self.cheat_error {
+                ui.colored_label(Color32::from_rgb(230, 120, 80), err);
+            }
+            ui.label(egui::RichText::new(format!("Saved to {}", emu.cheats_path().display())).small().weak());
+        });
+        if let Some(i) = remove {
+            emu.core.remove_cheat_set(i);
+            changed = true;
+        }
+        if changed {
+            if let Err(e) = emu.write_cheats() {
+                self.error = Some(format!("Couldn't write cheats file: {e}"));
+            }
+        }
+        if !open {
+            self.show_cheats = false;
+            self.cheat_error = None;
+        }
+    }
+
     fn windows(&mut self, ctx: &egui::Context) {
+        self.cheats_window(ctx);
         if self.show_keymap {
             let mut open = true;
             egui::Window::new("Controls").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
                 egui::Grid::new("keymap").striped(true).show(ui, |ui| {
+                    ui.strong("Button");
+                    ui.strong("Keyboard");
+                    ui.strong("Controller");
+                    ui.end_row();
                     for b in Button::ALL {
                         ui.label(b.name());
                         let label = if self.rebinding == Some(b) {
@@ -952,19 +1195,42 @@ impl App {
                         };
                         if ui.button(label).clicked() {
                             self.rebinding = Some(b);
+                            self.rebinding_pad = None;
+                        }
+                        let pad_label = if self.rebinding_pad == Some(b) {
+                            "Press a controller button…".to_string()
+                        } else {
+                            self.settings
+                                .pad_map
+                                .iter()
+                                .find(|(btn, _)| *btn == b)
+                                .map(|(_, c)| gamepad::button_name(*c))
+                                .unwrap_or_else(|| "—".into())
+                        };
+                        if ui.button(pad_label).clicked() {
+                            self.rebinding_pad = Some(b);
+                            self.rebinding = None;
                         }
                         ui.end_row();
                     }
                 });
+                let pads = self.gamepads.connected();
+                if pads.is_empty() {
+                    ui.label("No controller detected (plug one in; the stick and d-pad both steer).");
+                } else {
+                    ui.label(format!("Controllers: {}", pads.join(", ")));
+                }
                 ui.separator();
-                ui.label("Hold Tab to fast-forward. F1–F9 load and Shift+F1–F9 save states.");
+                ui.label("Hold Tab to fast-forward and ` (backtick) to rewind. F1–F9 load and Shift+F1–F9 save states.");
                 if ui.button("Restore defaults").clicked() {
                     self.settings.keymap = Settings::default().keymap;
+                    self.settings.pad_map = gamepad::default_mapping();
                 }
             });
             if !open {
                 self.show_keymap = false;
                 self.rebinding = None;
+                self.rebinding_pad = None;
             }
         }
         if self.show_about {

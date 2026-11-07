@@ -8,6 +8,7 @@ use std::path::Path;
 
 use mgba_core::gb::{self, model};
 use mgba_core::gba::{self, LogLevel};
+use mgba_core::cheats::{CheatDevice, CheatSet};
 use mgba_core::{Gb, Gba};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,7 +42,10 @@ impl Core {
     pub fn screen_size(&self) -> [usize; 2] {
         match self {
             Core::Gba(_) => [gba::VIDEO_HORIZONTAL_PIXELS, gba::VIDEO_VERTICAL_PIXELS],
-            Core::Gb(_) => [gb::VIDEO_HORIZONTAL_PIXELS, gb::VIDEO_VERTICAL_PIXELS],
+            Core::Gb(g) => {
+                let (w, h) = g.video_size();
+                [w, h]
+            }
         }
     }
 
@@ -169,6 +173,52 @@ impl Core {
         match self {
             Core::Gba(g) => g.skip_bios_on_reset = on,
             Core::Gb(g) => g.skip_bios_on_reset = on,
+        }
+    }
+
+    pub fn cheats(&self) -> &CheatDevice {
+        match self {
+            Core::Gba(g) => &g.cheats,
+            Core::Gb(g) => &g.cheats,
+        }
+    }
+
+    pub fn cheats_mut(&mut self) -> &mut CheatDevice {
+        match self {
+            Core::Gba(g) => &mut g.cheats,
+            Core::Gb(g) => &mut g.cheats,
+        }
+    }
+
+    /// An empty cheat set for this system's code formats.
+    pub fn new_cheat_set(&self, name: &str) -> CheatSet {
+        match self {
+            Core::Gba(_) => CheatSet::new_gba(name),
+            Core::Gb(_) => CheatSet::new_gb(name),
+        }
+    }
+
+    /// Load sets from a `.cheats` file (added to any already present).
+    pub fn load_cheats(&mut self, text: &str) {
+        match self {
+            Core::Gba(g) => g.cheats.parse_file(text, CheatSet::new_gba),
+            Core::Gb(g) => g.cheats.parse_file(text, CheatSet::new_gb),
+        };
+    }
+
+    /// Remove a set, undoing any ROM patches it applied.
+    pub fn remove_cheat_set(&mut self, index: usize) {
+        match self {
+            Core::Gba(g) => {
+                let mut d = std::mem::take(&mut g.cheats);
+                d.remove_set(g.as_mut(), index);
+                g.cheats = d;
+            }
+            Core::Gb(g) => {
+                let mut d = std::mem::take(&mut g.cheats);
+                d.remove_set(g.as_mut(), index);
+                g.cheats = d;
+            }
         }
     }
 }
