@@ -1,3 +1,20 @@
 target/
 # Upstream mGBA source, used as reference and test data; clone it separately
 mgba-master/
+
+# Game ROMs, BIOS dumps, saves, save states and screenshots — never commit these
+*.gba
+*.agb
+*.gb
+*.gbc
+*.cgb
+*.sgb
+*.dmg
+*.zip
+*.7z
+*.sav
+*.ss[0-9]
+gba_bios.bin
+gb_bios.bin
+gbc_bios.bin
+sgb_bios.bin
