@@ -1,4 +1,4 @@
-//! mGBA-rs: a desktop Game Boy Advance emulator built on the Rust port of mGBA.
+//! mGBA-rs: a desktop Game Boy Advance and Game Boy (Color) emulator built on the Rust port of mGBA.
 //!
 //! This Source Code Form is subject to the terms of the Mozilla Public
 //! License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -6,6 +6,9 @@
 
 mod app;
 mod audio;
+mod core;
+mod gamepad;
+mod rewind;
 
 use std::path::PathBuf;
 

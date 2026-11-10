@@ -1898,6 +1898,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "libc",
  "libloading",
  "mgba-core",
  "png 0.17.16",

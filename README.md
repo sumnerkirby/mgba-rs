@@ -1,8 +1,8 @@
 # mGBA-rs
 
-A Rust rewrite of [mGBA](https://mgba.io)'s Game Boy Advance emulator, with a desktop GUI.
+A Rust rewrite of [mGBA](https://mgba.io)'s Game Boy Advance and Game Boy / Game Boy Color emulators, with a desktop GUI.
 
-This is a faithful port: the CPU, memory map, scheduler, DMA, timers, audio and the software renderer follow mGBA's C code (`mgba-master/src`) function by function, so timing and accuracy track the original. It's checked against mGBA's own test suite (see [Testing](#testing)).
+This is a faithful port: the CPUs, memory maps, scheduler, DMA, timers, audio and the software renderers follow mGBA's C code (`mgba-master/src`) function by function, so timing and accuracy track the original. It's checked against mGBA's own test suite (see [Testing](#testing)).
 
 ## Layout
 
@@ -12,6 +12,9 @@ This is a faithful port: the CPU, memory map, scheduler, DMA, timers, audio and 
 | `crates/mgba-core/src/arm` | ARM7TDMI interpreter (`src/arm/*.c`) |
 | `crates/mgba-core/src/gba` | GBA system: memory, I/O, DMA, timers, video timing, audio, HLE BIOS, save memory, RTC, overrides (`src/gba/*.c`) |
 | `crates/mgba-core/src/gba/renderer` | Software renderer (`src/gba/renderers/video-software.c` and friends) |
+| `crates/mgba-core/src/sm83` | SM83 (Game Boy CPU) interpreter (`src/sm83/*.c`) |
+| `crates/mgba-core/src/gb` | Game Boy / Color system: memory, MBCs, I/O, timer, PPU timing, software renderer, APU (`src/gb/*.c`) |
+| `crates/mgba-core/src/timing.rs` | The event scheduler both systems share (`src/core/timing.c`) |
 | `crates/mgba-gui` | `mgba-rs`, the desktop app (egui/eframe) |
 | `mgba-master/` | The original mGBA source, kept for reference and for its test data |
 
@@ -27,18 +30,20 @@ cargo build --release
 ./target/release/mgba-rs path/to/game.gba
 ```
 
+Game Boy and Game Boy Color games (`.gb`, `.gbc`) open the same way; the core is picked from the ROM header (falling back to the file extension).
+
 You can also start it without arguments and use **File → Open ROM** or drag a ROM onto the window.
 
 ### Default controls
 
-| GBA | Key |
+| GBA / GB | Key |
 | --- | --- |
 | D-pad | Arrow keys |
 | A / B | X / Z |
-| L / R | A / S |
+| L / R (GBA only) | A / S |
 | Start / Select | Enter / Backspace |
 
-Keys can be remapped in **Settings → Controls**.
+Keys can be remapped in **Settings → Controls**. Game controllers work too (Linux, read directly from `/dev/input`, no extra libraries): by default the bottom face button is A, the right one is B, the shoulders are L/R and both the d-pad and left stick steer, as in mGBA. Controller buttons can be rebound in the same window.
 
 | Action | Shortcut |
 | --- | --- |
@@ -46,16 +51,19 @@ Keys can be remapped in **Settings → Controls**.
 | Pause / resume | Ctrl+P |
 | Reset | Ctrl+R |
 | Fast forward | hold Tab (or toggle in the Emulation menu) |
+| Rewind | hold ` (backtick); history length is set in the Emulation menu |
 | Load / save state | F1–F9 / Shift+F1–F9 |
 | Screenshot | F12 |
 | Fullscreen | F11 |
 
 ### Files
 
-- Battery saves are read from and written to `<rom name>.sav` next to the ROM, as mGBA does, so existing mGBA saves work.
+- Battery saves are read from and written to `<rom name>.sav` next to the ROM, as mGBA does, so existing mGBA saves work. For Game Boy MBC3 carts with a clock, the RTC block mGBA appends to the save is read and written too.
 - Save states go to `<rom name>.ss1` … `.ss9`. They use this port's own format and are not interchangeable with mGBA's.
 - Screenshots are written next to the ROM as PNG.
-- A real GBA BIOS is optional (**Emulation → Choose BIOS file**). Without one, the built-in HLE BIOS from mGBA is used.
+- Cheats live in `<rom name>.cheats` next to the ROM, in mGBA's cheats file format (**Settings → Cheats…** to add, toggle or remove them).
+- A real GBA BIOS is optional (**Emulation → Choose GBA BIOS file**). Without one, the built-in HLE BIOS from mGBA is used.
+- Game Boy and Game Boy Color boot ROMs are optional too (**Emulation → Game Boy boot ROMs**). Without one the boot sequence is skipped and registers are set as the boot ROM would leave them, like mGBA. **Emulation → Game Boy model** forces a model (DMG, MGB, SGB, SGB2, CGB, AGB); otherwise it follows the cartridge header.
 
 ## What's ported
 
@@ -66,14 +74,34 @@ Keys can be remapped in **Settings → Controls**.
 - Audio: the four PSG channels and both Direct Sound FIFOs with mGBA's mixing and SOUNDBIAS resolution handling
 - High-level BIOS emulation (division, sqrt, arctan, affine set-up, LZ77/Huffman/RLE/diff decompression, CpuSet, register RAM reset and more)
 - Cartridge GPIO with the real-time clock, and mGBA's per-game override table (save types, RTC, idle loops)
+- Cheats: mGBA's cheat engine with GameShark / Action Replay v1–v2 (encrypted or raw), Pro Action Replay v3, CodeBreaker (including its encryption) and VBA-style codes, plus ROM patches; the format is detected automatically
+
+### Game Boy / Game Boy Color
+
+- SM83 CPU with mGBA's micro-op (M-cycle) model, including the HALT bug, EI delay and double speed
+- Memory map with OAM DMA bus conflicts, CGB HDMA/GDMA, WRAM banking and open-bus cartridge behavior
+- MBC1 (incl. multicarts), MBC2, MBC3 with RTC, MBC5 (incl. rumble flag), MBC6, MBC7 (EEPROM; no tilt sensor), MMM01, HuC-1, HuC-3 (with clock), TAMA5 (with clock), the Pocket Camera (captures an image supplied by the frontend; the GUI has no camera yet), M161, and the unlicensed Wisdom Tree, PKJD, NT, BBD, Hitek, Li Cheng, GGB-81, Sachen and Sintax mappers, with mGBA's detection and override table
+- Timer with mGBA's DIV/TIMA edge timing, serial port (no link partner)
+- PPU mode timing and STAT/LYC interrupts, and the software renderer for DMG and CGB (priorities, banks, flips, window quirks, AGB color correction)
+- Super Game Boy models: palette and attribute commands, VRAM transfers, multiplayer requests and borders (256x224 output with the default or game-supplied border; toggle in the Video menu)
+- APU in DMG and CGB styles (sweep, envelopes, wave RAM quirks, LFSR noise), mixed like mGBA at 131072 Hz and averaged to 32768 Hz for output
+- Model detection and selection (DMG, MGB, SGB, SGB2, CGB, AGB) and optional boot ROMs
+- Cheats: GameShark, CodeBreaker, Game Genie (including bank-checked ROM patches) and VBA-style codes
+- Playback of mGBA video logs recorded from a Game Boy (`Gb::load_mvl_state` / `Gb::mvl_packet`)
+
+### Frontend
+
+- Rewind (hold `), with history stored as compressed differences between save states so 30 seconds costs tens of megabytes, not hundreds
+- Game controller input and rebinding (Linux)
 
 ## Not ported yet
 
-- The Game Boy / Game Boy Color core (planned as the next milestone)
-- Link cable / multiplayer (serial transfers complete as if nothing is connected), e-Reader, GB Player
+- Link cable / multiplayer for both systems (serial transfers complete as if nothing is connected), e-Reader, GB Player
+- Game Boy: GBX files, a camera source for the Pocket Camera in the GUI
 - Gyro, tilt, solar and rumble sensors (they're recognized, but not driven)
-- Debugger, Lua scripting, cheats, ROM patches, multiboot/ELF images, idle-loop auto-detection, AGBPrint
-- Rewind, gamepad input and audio/video recording in the GUI
+- GBA cheat "hooks" run at the end of each frame instead of at the hooked address (there are no ROM breakpoints)
+- Debugger, Lua scripting, ROM patches (IPS/UPS/BPS), multiboot/ELF images, idle-loop auto-detection, AGBPrint
+- Audio/video recording in the GUI; game controllers on platforms other than Linux
 - Audio output is currently Linux-only (ALSA, loaded at runtime so building needs no system headers; PipeWire and PulseAudio both serve it). On other platforms the GUI runs silently.
 
 ## Testing
@@ -85,6 +113,10 @@ cargo test --release
 ```
 
 This runs every GBA ROM test and every video log and requires a pixel-exact match with mGBA's baselines (currently 3 ROM tests and 23 video logs, all passing), plus a save-state determinism check.
+
+It also runs the Game Boy ROM tests in `cinema/gb` (blargg, mooneye-gb, acid2, samesuite, ramg-mbc3): 236 tests, of which 148 match mGBA's correct baseline and the other 88 are tests mGBA itself is marked as failing (`fail=1`). For those, 87 match mGBA's recorded wrong output (`xbaseline_*.png`) pixel for pixel, and one has no reference image at all, which mGBA's runner also counts as an expected failure. No test differs from mGBA. The 10 Game Boy video logs in `cinema/gb/window` (including a Super Game Boy one with its border) replay pixel-exactly too.
+
+Headless checks cover GB sound output, battery saves, the MBC3/HuC-3/TAMA5 clock blocks, the newer mappers, the Pocket Camera, cheats in every format, and save states.
 
 Developer tools live in `crates/mgba-core/examples`:
 
@@ -98,6 +130,10 @@ cargo run --release -p mgba-core --example mvl -- mgba-master/cinema/gba/bg/lady
 
 ```bash
 cargo run --release -p mgba-core --example bench -- game.gba 3000
+```
+
+```bash
+cargo run --release -p mgba-core --example gb -- game.gb 600 /tmp/frame.png
 ```
 
 `trace` and `steptrace` print CPU state per frame or per instruction for debugging.

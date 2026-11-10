@@ -67,6 +67,7 @@ impl Gba {
         new.memory.bios = std::mem::take(&mut self.memory.bios);
         new.memory.full_bios = self.memory.full_bios;
         new.log_enabled = self.log_enabled;
+        new.cheats = std::mem::take(&mut self.cheats);
         let mut renderer = std::mem::take(&mut self.renderer);
         let audio_buffer = std::mem::take(&mut self.audio.buffer);
         *self = new;

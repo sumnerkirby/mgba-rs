@@ -47,23 +47,49 @@ impl EventId {
     }
 }
 
+impl TimingEvent for EventId {
+    #[inline]
+    fn index(self) -> usize {
+        self as usize
+    }
+    #[inline]
+    fn priority(self) -> u32 {
+        EventId::priority(self)
+    }
+}
+
+/// An event identifier usable with [`Timing`]: each system (GBA, GB) has its
+/// own enum, standing in for mGBA's per-event `struct mTimingEvent`.
+pub trait TimingEvent: Copy + PartialEq + std::fmt::Debug {
+    fn index(self) -> usize;
+    fn priority(self) -> u32;
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
-pub struct Event {
-    pub id: EventId,
+pub struct Event<E = EventId> {
+    pub id: E,
     pub when: u32,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
-pub struct Timing {
-    pub root: Vec<Event>,
-    pub reroot: Vec<Event>,
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(bound(serialize = "E: serde::Serialize", deserialize = "E: serde::Deserialize<'de>"))]
+pub struct Timing<E = EventId, const N: usize = EVENT_COUNT> {
+    pub root: Vec<Event<E>>,
+    pub reroot: Vec<Event<E>>,
     pub global_cycles: u64,
     pub master_cycles: u32,
     /// The `when` field of each event struct; retained after it fires, like mGBA's.
-    pub whens: [u32; EVENT_COUNT],
+    #[serde(with = "serde_big_array::BigArray")]
+    pub whens: [u32; N],
 }
 
-impl Timing {
+impl<E, const N: usize> Default for Timing<E, N> {
+    fn default() -> Self {
+        Timing { root: Vec::new(), reroot: Vec::new(), global_cycles: 0, master_cycles: 0, whens: [0; N] }
+    }
+}
+
+impl<E: TimingEvent, const N: usize> Timing<E, N> {
     pub fn clear(&mut self) {
         self.root.clear();
         self.reroot.clear();
@@ -79,7 +105,7 @@ impl Timing {
         self.reroot = std::mem::take(&mut self.root);
     }
 
-    fn active_list(&mut self) -> &mut Vec<Event> {
+    fn active_list(&mut self) -> &mut Vec<Event<E>> {
         if !self.reroot.is_empty() {
             &mut self.reroot
         } else {
@@ -89,7 +115,7 @@ impl Timing {
 
     /// `mTimingSchedule`. `relative` is the CPU's current cycle count and
     /// `next_event` the CPU's next-event marker.
-    pub fn schedule(&mut self, id: EventId, when: i32, relative: i32, next_event: &mut i32) {
+    pub fn schedule(&mut self, id: E, when: i32, relative: i32, next_event: &mut i32) {
         self.deschedule(id);
         let next = when.wrapping_add(relative);
         let abs = (next as u32).wrapping_add(self.master_cycles);
@@ -112,7 +138,7 @@ impl Timing {
     }
 
     /// `mTimingDeschedule`
-    pub fn deschedule(&mut self, id: EventId) {
+    pub fn deschedule(&mut self, id: E) {
         let list = self.active_list();
         if let Some(pos) = list.iter().position(|e| e.id == id) {
             list.remove(pos);
@@ -120,7 +146,7 @@ impl Timing {
     }
 
     /// `mTimingIsScheduled`
-    pub fn is_scheduled(&self, id: EventId) -> bool {
+    pub fn is_scheduled(&self, id: E) -> bool {
         let list = if self.root.is_empty() { &self.reroot } else { &self.root };
         list.iter().any(|e| e.id == id)
     }
@@ -140,12 +166,12 @@ impl Timing {
     }
 
     /// `mTimingUntil`
-    pub fn until(&self, id: EventId, relative: i32) -> i32 {
+    pub fn until(&self, id: E, relative: i32) -> i32 {
         self.whens[id.index()].wrapping_sub(self.master_cycles).wrapping_sub(relative as u32) as i32
     }
 
     /// Absolute `when` of a scheduled event (for serialization).
-    pub fn event_when(&self, id: EventId) -> Option<u32> {
+    pub fn event_when(&self, id: E) -> Option<u32> {
         let list = if self.root.is_empty() { &self.reroot } else { &self.root };
         list.iter().find(|e| e.id == id).map(|e| e.when)
     }
