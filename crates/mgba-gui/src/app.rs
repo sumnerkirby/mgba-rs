@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::{AudioOut, Resampler};
 use crate::core::{detect_platform, run_linked_frame, Core, LinkCable, Platform};
+use mgba_core::debugger::{self, Debugger, EntryReason, State as DebuggerState};
+use mgba_core::gba::IdleLoopOptimization;
+use mgba_core::mem_search::{self, SearchOp, SearchParams, SearchResult, SearchType};
+use mgba_script::{LogKind, ScriptHost};
 use crate::gamepad::{self, Gamepads};
 use crate::rewind::{Rewind, Snapshot};
 
@@ -120,6 +124,8 @@ pub struct Settings {
     /// Seconds of history kept for rewinding.
     pub rewind_seconds: u32,
     pub pause_when_unfocused: bool,
+    /// GBA idle-loop handling (mGBA's `idleOptimization`): 0 ignore, 1 remove, 2 detect.
+    pub idle_optimization: u8,
 }
 
 impl Default for Settings {
@@ -168,6 +174,7 @@ impl Default for Settings {
             rewind_enabled: true,
             rewind_seconds: 30,
             pause_when_unfocused: false,
+            idle_optimization: 1,
         }
     }
 }
@@ -256,6 +263,36 @@ impl FpsCounter {
     }
 }
 
+/// The memory search window's state (mGBA's cheat finder).
+pub struct MemorySearch {
+    value: String,
+    width: i32,
+    op: SearchOp,
+    guess: bool,
+    results: Vec<SearchResult>,
+    message: String,
+}
+
+impl Default for MemorySearch {
+    fn default() -> Self {
+        MemorySearch { value: String::new(), width: 1, op: SearchOp::Equal, guess: true, results: Vec::new(), message: String::new() }
+    }
+}
+
+/// Command-line options for the first ROM.
+#[derive(Default)]
+pub struct StartOptions {
+    pub rom: Option<PathBuf>,
+    /// `Some(None)` links a second player running the same game.
+    pub link: Option<Option<PathBuf>>,
+    /// Attach mGBA's command-line debugger to the terminal.
+    pub debug_cli: bool,
+    /// Listen for GDB on this port.
+    pub gdb_port: Option<u16>,
+    /// Lua scripts to load, as mGBA's `--script`.
+    pub scripts: Vec<PathBuf>,
+}
+
 pub struct App {
     settings: Settings,
     emu: Option<Emulator>,
@@ -277,6 +314,15 @@ pub struct App {
     gamepads: Gamepads,
     link: Option<Link>,
     texture_p2: Option<TextureHandle>,
+    /// An attached debugger (CLI on the terminal or a GDB server).
+    debugger: Option<Debugger>,
+    debugger_label: String,
+    show_search: bool,
+    search: MemorySearch,
+    /// Loaded Lua scripts (mGBA's scripting bridge) and their console.
+    scripts: Option<ScriptHost>,
+    script_lines: Vec<String>,
+    show_scripts: bool,
     rewind: Rewind,
     rewind_tick: u32,
     rewinding: bool,
@@ -296,7 +342,7 @@ pub struct App {
 impl App {
     /// `rom` is loaded for player 1; `link` (`Some(None)` for the same game)
     /// starts a linked player 2.
-    pub fn new(cc: &eframe::CreationContext<'_>, rom: Option<PathBuf>, link: Option<Option<PathBuf>>) -> App {
+    pub fn new(cc: &eframe::CreationContext<'_>, options: StartOptions) -> App {
         let settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
@@ -322,6 +368,13 @@ impl App {
             gamepads: Gamepads::new(),
             link: None,
             texture_p2: None,
+            debugger: None,
+            debugger_label: String::new(),
+            show_search: false,
+            search: MemorySearch::default(),
+            scripts: None,
+            script_lines: Vec::new(),
+            show_scripts: false,
             rewind: Rewind::new(1),
             rewind_tick: 0,
             rewinding: false,
@@ -339,10 +392,19 @@ impl App {
         if app.audio.is_none() {
             app.set_status("No audio device available; running without sound");
         }
-        if let Some(path) = rom {
+        if let Some(path) = options.rom {
             app.load_rom(&cc.egui_ctx, &path);
-            if let Some(p2) = link {
+            if let Some(p2) = options.link {
                 app.start_player2(&cc.egui_ctx, p2);
+            }
+            if options.debug_cli {
+                app.start_cli_debugger();
+            }
+            if let Some(port) = options.gdb_port {
+                app.start_gdb(port);
+            }
+            for script in options.scripts {
+                app.load_script(&script);
             }
         }
         app
@@ -424,6 +486,11 @@ impl App {
             gba.load_save(save);
             gba.reset();
         }
+        gba.set_idle_optimization(match self.settings.idle_optimization {
+            0 => IdleLoopOptimization::Ignore,
+            2 => IdleLoopOptimization::Detect,
+            _ => IdleLoopOptimization::Remove,
+        });
         Some(Core::Gba(Box::new(gba)))
     }
 
@@ -466,12 +533,158 @@ impl App {
     }
 
     fn close_rom(&mut self) {
+        if let (Some(host), Some(emu)) = (&mut self.scripts, &mut self.emu) {
+            host.trigger(emu.core.mcore(), "stop");
+        }
+        self.stop_debugger();
         self.stop_player2();
         if let Some(mut emu) = self.emu.take() {
             if let Err(e) = emu.write_save() {
                 self.error = Some(format!("Couldn't write save file {}: {e}", emu.save_path.display()));
             }
         }
+    }
+
+    // ----- Scripting -----
+
+    /// Load a Lua script (mGBA's Tools → Scripting → Load script).
+    fn load_script(&mut self, path: &Path) {
+        let Some(emu) = &mut self.emu else {
+            self.error = Some("Load a game before loading a script".into());
+            return;
+        };
+        let code = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.error = Some(format!("Couldn't read {}: {e}", path.display()));
+                return;
+            }
+        };
+        if self.scripts.is_none() {
+            match ScriptHost::new() {
+                Ok(h) => self.scripts = Some(h),
+                Err(e) => {
+                    self.error = Some(format!("Couldn't start Lua: {e}"));
+                    return;
+                }
+            }
+        }
+        let host = self.scripts.as_mut().unwrap();
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        match host.load(emu.core.mcore(), &name, &code) {
+            Ok(()) => {
+                // mGBA fires "start" for scripts loaded while a game runs.
+                host.trigger(emu.core.mcore(), "start");
+                self.set_status(format!("Loaded script {name}"));
+            }
+            Err(e) => self.set_status(format!("Script error: {e}")),
+        }
+        self.show_scripts = true;
+    }
+
+    fn open_script_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().set_title("Load Lua script").add_filter("Lua script", &["lua"]).pick_file() {
+            self.load_script(&path);
+        }
+    }
+
+    /// The scripting window: console output and text buffers.
+    fn scripts_window(&mut self, ctx: &egui::Context) {
+        if let Some(host) = &mut self.scripts {
+            for (kind, msg) in host.drain_output() {
+                let prefix = match kind {
+                    LogKind::Log => "",
+                    LogKind::Warn => "[warn] ",
+                    LogKind::Error => "[error] ",
+                };
+                self.script_lines.push(format!("{prefix}{msg}"));
+            }
+            let excess = self.script_lines.len().saturating_sub(1000);
+            self.script_lines.drain(..excess);
+        }
+        if !self.show_scripts {
+            return;
+        }
+        let mut open = true;
+        let buffers = self.scripts.as_ref().map(|h| h.buffers()).unwrap_or_default();
+        egui::Window::new("Scripting").open(&mut open).default_size([460.0, 320.0]).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Load script…").clicked() {
+                    self.open_script_dialog();
+                }
+                if ui.button("Unload all").clicked() {
+                    self.scripts = None;
+                    self.script_lines.push("Scripts unloaded".into());
+                }
+            });
+            for b in &buffers {
+                ui.separator();
+                ui.strong(if b.name.is_empty() { "Buffer" } else { &b.name });
+                ui.monospace(b.text());
+            }
+            ui.separator();
+            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                for l in &self.script_lines {
+                    ui.monospace(l);
+                }
+            });
+        });
+        if !open {
+            self.show_scripts = false;
+        }
+    }
+
+    // ----- Debugging -----
+
+    /// Attach a debugger with `module` and stop at once
+    /// (`mDebuggerAttach` + `DEBUGGER_ENTER_ATTACHED`, as mGBA's `-d`/`-g`).
+    fn attach_debugger(&mut self, module: Box<dyn debugger::Module>, label: String) {
+        let Some(emu) = &mut self.emu else { return };
+        if self.link.is_some() {
+            self.error = Some("Disconnect player 2 before debugging".into());
+            return;
+        }
+        let mut d = Debugger::new();
+        d.attach_module(module);
+        let core = emu.core.debug_core();
+        d.attach(core);
+        d.enter(core, EntryReason::Attached, None);
+        self.debugger = Some(d);
+        self.set_status(format!("{label} attached; emulation is paused until it continues"));
+        self.debugger_label = label;
+    }
+
+    /// mGBA's `-d`: the command-line debugger on this terminal.
+    fn start_cli_debugger(&mut self) {
+        if self.debugger.is_some() {
+            return;
+        }
+        let module = debugger::cli::CliDebugger::new(Box::new(debugger::cli::ChannelBackend::stdin()));
+        self.attach_debugger(Box::new(module), "CLI debugger (terminal)".into());
+    }
+
+    /// mGBA's `-g`: a GDB server on localhost.
+    fn start_gdb(&mut self, port: u16) {
+        if self.debugger.is_some() {
+            return;
+        }
+        if !matches!(self.emu.as_ref().map(|e| e.core.platform()), Some(Platform::Gba)) {
+            self.error = Some("The GDB server is for Game Boy Advance games (as in mGBA)".into());
+            return;
+        }
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        match debugger::gdb::GdbStub::listen(address, debugger::gdb::WatchpointsBehavior::StandardLogic) {
+            Ok(stub) => self.attach_debugger(Box::new(stub), format!("GDB server on 127.0.0.1:{port}")),
+            Err(e) => self.error = Some(format!("Couldn't listen on port {port}: {e}")),
+        }
+    }
+
+    fn stop_debugger(&mut self) {
+        let Some(mut d) = self.debugger.take() else { return };
+        if let Some(emu) = &mut self.emu {
+            d.detach(emu.core.debug_core());
+        }
+        self.set_status("Debugger detached");
     }
 
     // ----- Link cable -----
@@ -677,6 +890,9 @@ impl App {
             if let Some(link) = &mut self.link {
                 link.p2.core.reset();
             }
+            if let Some(host) = &mut self.scripts {
+                host.trigger(emu.core.mcore(), "reset");
+            }
             self.shown_frame = None;
             self.set_status("Reset");
         }
@@ -785,7 +1001,8 @@ impl App {
         }
 
         let emu = self.emu.as_mut().unwrap();
-        emu.core.set_keys(keys);
+        let script_keys = self.scripts.as_ref().map_or(0, |h| h.keys() as u16);
+        emu.core.set_keys(keys | script_keys);
         self.audio_scratch.clear();
         // One snapshot every other frame, like mGBA's rewind interval setting.
         const REWIND_INTERVAL: u32 = 2;
@@ -797,6 +1014,29 @@ impl App {
         if let Some(link) = &mut self.link {
             link.p2.core.set_keys(keys_p2);
         }
+        if let Some(d) = &mut self.debugger {
+            // While a debugger is attached it drives the core (mDebuggerRunFrame),
+            // and stays responsive while paused.
+            let core = emu.core.debug_core();
+            if d.state == DebuggerState::Paused {
+                d.run_timeout(core, 0);
+                frames = 0;
+            } else {
+                for _ in 0..frames {
+                    d.run_frame(core, 0);
+                    if d.state != DebuggerState::Running && d.state != DebuggerState::Callback {
+                        break;
+                    }
+                }
+                frames = 0;
+            }
+            if d.is_shutdown() {
+                // `quit` in the debugger quits the emulator, as in mGBA.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ctx.request_repaint();
+            emu.core.drain_audio(&mut self.audio_scratch);
+        }
         for _ in 0..frames {
             if let Some(link) = &mut self.link {
                 run_linked_frame(&mut [&mut emu.core, &mut link.p2.core]);
@@ -806,7 +1046,10 @@ impl App {
             } else {
                 emu.core.run_frame();
             }
-            if self.settings.rewind_enabled && self.link.is_none() {
+            if let Some(host) = &mut self.scripts {
+                host.trigger(emu.core.mcore(), "frame");
+            }
+            if self.settings.rewind_enabled && self.link.is_none() && self.debugger.is_none() {
                 self.rewind_tick += 1;
                 if self.rewind_tick >= REWIND_INTERVAL {
                     self.rewind_tick = 0;
@@ -1078,6 +1321,21 @@ impl App {
                     }
                 }
                 ui.separator();
+                ui.menu_button("Idle loops (GBA)", |ui| {
+                    for (name, v) in [("Run them (ignore)", 0u8), ("Skip known ones (remove)", 1), ("Detect and skip (detect)", 2)] {
+                        if ui.radio(self.settings.idle_optimization == v, name).clicked() {
+                            self.settings.idle_optimization = v;
+                            if let Some(Emulator { core: Core::Gba(g), .. }) = &mut self.emu {
+                                g.set_idle_optimization(match v {
+                                    0 => IdleLoopOptimization::Ignore,
+                                    2 => IdleLoopOptimization::Detect,
+                                    _ => IdleLoopOptimization::Remove,
+                                });
+                            }
+                            ui.close();
+                        }
+                    }
+                });
                 ui.menu_button("Game Boy model", |ui| {
                     for (name, m) in GB_MODELS {
                         if ui.radio(self.settings.gb_model == m, name).clicked() {
@@ -1226,6 +1484,44 @@ impl App {
                 }
             });
 
+            ui.menu_button("Tools", |ui| {
+                let has = self.emu.is_some();
+                let debugging = self.debugger.is_some();
+                if ui.add_enabled(has, egui::Button::new("Memory search…")).clicked() {
+                    self.show_search = true;
+                    ui.close();
+                }
+                if ui.add_enabled(has, egui::Button::new("Load Lua script…")).clicked() {
+                    ui.close();
+                    self.open_script_dialog();
+                }
+                if ui.button("Scripting window").clicked() {
+                    self.show_scripts = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(has && !debugging, egui::Button::new("Debugger in terminal"))
+                    .on_hover_text("mGBA's command-line debugger on the terminal this was started from (type `help`)")
+                    .clicked()
+                {
+                    ui.close();
+                    self.start_cli_debugger();
+                }
+                if ui
+                    .add_enabled(has && !debugging, egui::Button::new("Start GDB server (port 2345)"))
+                    .on_hover_text("Connect with `target remote localhost:2345` (GBA only)")
+                    .clicked()
+                {
+                    ui.close();
+                    self.start_gdb(2345);
+                }
+                if ui.add_enabled(debugging, egui::Button::new("Detach debugger")).clicked() {
+                    ui.close();
+                    self.stop_debugger();
+                }
+            });
+
             ui.menu_button("Help", |ui| {
                 if ui.button("About").clicked() {
                     self.show_about = true;
@@ -1302,6 +1598,11 @@ impl App {
                 if let Some(link) = &self.link {
                     ui.separator();
                     ui.label(format!("Linked with player 2: {}", link.p2.title));
+                }
+                if let Some(d) = &self.debugger {
+                    ui.separator();
+                    let state = if d.state == DebuggerState::Paused { "paused" } else { "running" };
+                    ui.label(format!("{} ({state})", self.debugger_label));
                 }
             }
             if let Some((msg, at)) = &self.status {
@@ -1398,8 +1699,103 @@ impl App {
         }
     }
 
+    /// mGBA's memory search window (`MemorySearch.cpp` over `mem-search.c`).
+    fn search_window(&mut self, ctx: &egui::Context) {
+        if !self.show_search {
+            return;
+        }
+        let mut open = true;
+        let Some(emu) = &mut self.emu else {
+            self.show_search = false;
+            return;
+        };
+        let st = &mut self.search;
+        egui::Window::new("Memory search").open(&mut open).default_size([380.0, 420.0]).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Value:");
+                ui.text_edit_singleline(&mut st.value);
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut st.guess, "Guess (decimal, hex, scaled)");
+                ui.add_enabled_ui(!st.guess, |ui| {
+                    for (w, name) in [(1, "8-bit"), (2, "16-bit"), (4, "32-bit")] {
+                        ui.radio_value(&mut st.width, w, name);
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Match:");
+                for (op, name) in [
+                    (SearchOp::Equal, "="),
+                    (SearchOp::Greater, ">"),
+                    (SearchOp::Less, "<"),
+                    (SearchOp::Delta, "changed by"),
+                    (SearchOp::DeltaAny, "changed"),
+                ] {
+                    ui.radio_value(&mut st.op, op, name);
+                }
+            });
+            let parsed: Option<i32> = {
+                let v = st.value.trim();
+                v.strip_prefix("0x").map_or_else(|| v.parse().ok(), |h| i32::from_str_radix(h, 16).ok())
+            };
+            let params = SearchParams {
+                memory_flags: mgba_core::core::MEMORY_WRITE,
+                ty: if st.guess { SearchType::Guess } else { SearchType::Int },
+                op: st.op,
+                align: if st.guess { -1 } else { st.width },
+                width: if st.guess { -1 } else { st.width },
+                value_int: parsed.unwrap_or(0),
+                value_str: st.value.trim().to_string(),
+            };
+            ui.horizontal(|ui| {
+                if ui.button("New search").clicked() {
+                    st.results = mem_search::search(emu.core.mcore(), &params, 10000);
+                    st.message = format!("{} results", st.results.len());
+                }
+                if ui.add_enabled(!st.results.is_empty(), egui::Button::new("Refine")).clicked() {
+                    mem_search::search_repeat(emu.core.mcore(), &params, &mut st.results);
+                    st.message = format!("{} results", st.results.len());
+                }
+                if ui.button("Clear").clicked() {
+                    st.results.clear();
+                    st.message.clear();
+                }
+            });
+            ui.label(&st.message);
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("search-results").striped(true).show(ui, |ui| {
+                    ui.strong("Address");
+                    ui.strong("Value");
+                    ui.end_row();
+                    for r in st.results.iter().take(500) {
+                        let core = emu.core.mcore();
+                        let value = match r.width {
+                            2 => core.raw_read16(r.address, r.segment),
+                            4 => core.raw_read32(r.address, r.segment),
+                            _ => core.raw_read8(r.address, r.segment),
+                        };
+                        ui.monospace(format!("{:08X}", r.address));
+                        if r.guess_divisor > 1 {
+                            ui.monospace(format!("{} (×{})", value, r.guess_divisor));
+                        } else {
+                            ui.monospace(format!("{value}"));
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        if !open {
+            self.show_search = false;
+        }
+    }
+
     fn windows(&mut self, ctx: &egui::Context) {
         self.cheats_window(ctx);
+        self.search_window(ctx);
+        self.scripts_window(ctx);
         if self.show_keymap {
             let mut open = true;
             egui::Window::new("Controls").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {

@@ -88,6 +88,22 @@ pub fn run_linked_frame(cores: &mut [&mut Core]) {
 }
 
 impl Core {
+    /// The core as mGBA's `mCore` interface (for memory search and tools).
+    pub fn mcore(&mut self) -> &mut dyn mgba_core::core::MCore {
+        match self {
+            Core::Gba(g) => g.as_mut(),
+            Core::Gb(g) => g.as_mut(),
+        }
+    }
+
+    /// The core as the debugger sees it.
+    pub fn debug_core(&mut self) -> &mut dyn mgba_core::debugger::DebugCore {
+        match self {
+            Core::Gba(g) => g.as_mut(),
+            Core::Gb(g) => g.as_mut(),
+        }
+    }
+
     pub fn platform(&self) -> Platform {
         match self {
             Core::Gba(_) => Platform::Gba,

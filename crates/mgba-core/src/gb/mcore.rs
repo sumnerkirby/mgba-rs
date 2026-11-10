@@ -339,6 +339,30 @@ impl MCore for Gb {
         self.current_segment_at(address as u16)
     }
 
+    fn game_title(&self) -> String {
+        Self::game_title(self)
+    }
+
+    fn game_code(&self) -> String {
+        Self::game_code(self)
+    }
+
+    fn rom_size(&self) -> usize {
+        self.pristine_rom_size
+    }
+
+    fn crc32(&self) -> u32 {
+        self.rom_crc32
+    }
+
+    fn save_state_bytes(&self) -> Vec<u8> {
+        self.save_state()
+    }
+
+    fn load_state_bytes(&mut self, data: &[u8]) -> bool {
+        self.load_state(data).is_ok()
+    }
+
     fn debug_platform(&mut self) -> &mut Option<Box<DebugPlatform>> {
         &mut self.debugger
     }

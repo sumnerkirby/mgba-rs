@@ -139,6 +139,18 @@ pub trait MCore {
         -1
     }
 
+    /// `getGameTitle`
+    fn game_title(&self) -> String;
+    /// `getGameCode`
+    fn game_code(&self) -> String;
+    /// `romSize`
+    fn rom_size(&self) -> usize;
+    /// `checksum(mCHECKSUM_CRC32)`
+    fn crc32(&self) -> u32;
+    /// This port's save state (this port's own format).
+    fn save_state_bytes(&self) -> Vec<u8>;
+    fn load_state_bytes(&mut self, data: &[u8]) -> bool;
+
     /// The debugger state a core carries while one is attached.
     fn debug_platform(&mut self) -> &mut Option<Box<DebugPlatform>>;
 }

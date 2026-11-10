@@ -13,16 +13,28 @@ mod rewind;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
-    // mgba-rs [ROM] [--link [PLAYER2_ROM]]
-    let mut rom = None;
-    let mut link: Option<Option<PathBuf>> = None;
+    // mgba-rs [ROM] [--link [PLAYER2_ROM]] [-d|--debug] [-g|--gdb [PORT]] [--script FILE.lua]
+    let mut start = app::StartOptions::default();
     let mut args = std::env::args_os().skip(1).peekable();
     while let Some(arg) = args.next() {
-        if arg == "--link" {
-            let p2 = args.next_if(|a| !a.to_string_lossy().starts_with("--")).map(PathBuf::from);
-            link = Some(p2);
-        } else if rom.is_none() {
-            rom = Some(PathBuf::from(arg));
+        let text = arg.to_string_lossy().to_string();
+        match text.as_str() {
+            "--link" => {
+                let p2 = args.next_if(|a| !a.to_string_lossy().starts_with('-')).map(PathBuf::from);
+                start.link = Some(p2);
+            }
+            "-d" | "--debug" => start.debug_cli = true,
+            "--script" => {
+                if let Some(path) = args.next() {
+                    start.scripts.push(PathBuf::from(path));
+                }
+            }
+            "-g" | "--gdb" => {
+                let port = args.next_if(|a| a.to_string_lossy().parse::<u16>().is_ok());
+                start.gdb_port = Some(port.and_then(|p| p.to_string_lossy().parse().ok()).unwrap_or(2345));
+            }
+            _ if start.rom.is_none() => start.rom = Some(PathBuf::from(arg)),
+            _ => {}
         }
     }
     let options = eframe::NativeOptions {
@@ -34,5 +46,5 @@ fn main() -> eframe::Result {
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native("mgba-rs", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, rom, link)))))
+    eframe::run_native("mgba-rs", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, start)))))
 }
