@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mgba-core", "crates/mgba-gui"]
+members = ["crates/mgba-core", "crates/mgba-gui", "crates/mgba-script"]
 
 [workspace.package]
 version = "0.1.0"

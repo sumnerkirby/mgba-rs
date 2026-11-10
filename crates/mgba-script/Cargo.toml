@@ -1,0 +1,10 @@
+[package]
+name = "mgba-script"
+description = "Lua scripting for the Rust mGBA port, with mGBA's script API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mgba-core = { path = "../mgba-core" }
+mlua = { version = "0.10", features = ["lua54", "vendored"] }

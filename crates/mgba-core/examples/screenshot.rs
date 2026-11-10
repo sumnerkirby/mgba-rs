@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 //! Run a ROM headlessly for N frames and save the last frame as a PNG.
 //! Usage: screenshot <rom> <frames> <out.png> [--bios FILE] [--skip-bios]
 use mgba_core::Gba;

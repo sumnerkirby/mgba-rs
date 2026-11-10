@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 mgba-core = { path = "../mgba-core" }
+mgba-script = { path = "../mgba-script" }
 eframe = { version = "0.37", features = ["persistence"] }
 egui = { version = "0.37", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

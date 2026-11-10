@@ -15,7 +15,7 @@ const PSR_STATE_MASK: u32 = 0x00000020;
 /// Decoded instruction class for a 12-bit table index (bits 27-20 and 7-4 of the opcode).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
-enum Op {
+pub(crate) enum Op {
     Ill,
     AluReg,
     AluImm,
@@ -149,6 +149,11 @@ const fn build_table() -> [Op; 0x1000] {
 }
 
 static ARM_TABLE: [Op; 0x1000] = build_table();
+
+/// The instruction class at a decoder-table index (shared with the disassembler).
+pub(crate) fn class_of(index: usize) -> Op {
+    ARM_TABLE[index]
+}
 
 #[inline(always)]
 pub fn execute<B: ArmBus>(bus: &mut B, opcode: u32) {

@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 //! Headless checks of Game Boy features the cinema suite doesn't cover:
 //! sound output, battery-backed SRAM, the MBC3 real-time clock and save states.
 //! The ROMs are assembled here from a few hand-written instructions.

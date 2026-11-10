@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 //! Runs a Game Boy ROM headlessly and writes the last frame as a PNG.
 //! Handy for checking a cinema test by eye or timing the core.
 //!

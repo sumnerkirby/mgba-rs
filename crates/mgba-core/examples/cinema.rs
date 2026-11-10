@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 //! Runs mGBA "cinema" test ROMs (test.gba + config.ini + baseline_NNNN.png)
 //! headlessly and compares each frame against the baseline images.
 //!

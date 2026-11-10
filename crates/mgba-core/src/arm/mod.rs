@@ -5,6 +5,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+pub mod decoder;
 pub mod isa_arm;
 pub mod isa_thumb;
 
@@ -492,6 +493,18 @@ pub fn run_loop<B: ArmBus>(bus: &mut B) {
         }
     }
     bus.process_events();
+}
+
+/// `ARMRun`: one instruction, then any events that are due.
+pub fn step<B: ArmBus>(bus: &mut B) {
+    if bus.cpu_ref().execution_mode == ExecutionMode::Thumb {
+        thumb_step(bus);
+    } else {
+        arm_step(bus);
+    }
+    if bus.cpu_ref().cycles >= bus.cpu_ref().next_event {
+        bus.process_events();
+    }
 }
 
 /// `ARMRunFake`: inject an opcode into the pipeline.

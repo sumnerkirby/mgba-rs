@@ -416,7 +416,10 @@ impl Gba {
                 self.cpu.gprs[11] = self.bios_stall;
                 return;
             }
-            0xFA => return, // AGBPrint flush
+            0xFA => {
+                self.agb_print_flush();
+                return;
+            }
             _ => {}
         }
 

@@ -10,10 +10,12 @@ pub mod audio;
 pub mod io;
 pub mod mbc;
 pub mod mbc_extra;
+pub mod mcore;
 pub mod memory;
 pub mod renderer;
 pub mod serialize;
 pub mod sgb_border;
+pub mod sio_lockstep;
 pub mod timer;
 pub mod video;
 pub mod video_log;
@@ -26,6 +28,7 @@ use crate::timing::{Timing, TimingEvent};
 pub use crate::gba::LogLevel;
 pub use audio::GbAudio;
 pub use io::GbSio;
+pub use sio_lockstep::{GbSioDriver, GbSioLockstep};
 pub use memory::GbMemory;
 pub use renderer::GbRenderer;
 pub use timer::GbTimer;
@@ -125,6 +128,9 @@ pub enum GbEvent {
     Dma,
     Hdma,
     Ei,
+    /// The link-cable node's event (`GBSIOLockstepNode::event`); past
+    /// `GB_EVENT_COUNT`, so it has no slot in the saved `Timing::whens`.
+    SioLockstep,
 }
 
 pub const GB_EVENT_COUNT: usize = 9;
@@ -145,6 +151,7 @@ impl TimingEvent for GbEvent {
             GbEvent::Sio => 0x30,
             GbEvent::Dma => 0x40,
             GbEvent::Hdma => 0x41,
+            GbEvent::SioLockstep => 0x80,
         }
     }
 }
@@ -180,6 +187,12 @@ pub struct Gb {
     pub timer: GbTimer,
     pub audio: GbAudio,
     pub sio: GbSio,
+    /// `sio.driver`: the link cable, when one is attached.
+    #[serde(skip)]
+    pub sio_driver: Option<GbSioDriver>,
+    /// The debugger's breakpoints and watchpoints while one is attached.
+    #[serde(skip)]
+    pub debugger: Option<Box<crate::debugger::Platform>>,
     pub model: u8,
 
     pub pristine_rom_size: usize,
@@ -340,6 +353,8 @@ impl Gb {
             timer: GbTimer::default(),
             audio: GbAudio::new(),
             sio: GbSio::default(),
+            sio_driver: None,
+            debugger: None,
             model: model::AUTODETECT,
             pristine_rom_size: 0,
             yanked_rom_size: 0,
@@ -435,6 +450,7 @@ impl Gb {
             GbEvent::TimerIrq => self.timer_irq(cycles_late),
             GbEvent::Timer => self.timer_update(cycles_late),
             GbEvent::Sio => self.sio_process_events(cycles_late),
+            GbEvent::SioLockstep => self.sio_lockstep_process_events(cycles_late),
             GbEvent::Dma => self.memory_dma_service(cycles_late),
             GbEvent::Hdma => self.memory_hdma_service(cycles_late),
             GbEvent::Ei => {
@@ -1183,10 +1199,16 @@ impl Sm83Bus for Gb {
     }
     #[inline(always)]
     fn load8(&mut self, address: u16) -> u8 {
+        if self.debugger.is_some() {
+            self.debug_watch(address, crate::debugger::WATCHPOINT_READ, 0);
+        }
         Gb::load8(self, address)
     }
     #[inline(always)]
     fn store8(&mut self, address: u16, value: u8) {
+        if self.debugger.is_some() {
+            self.debug_watch(address, crate::debugger::WATCHPOINT_WRITE, value);
+        }
         Gb::store8(self, address, value)
     }
     #[inline(always)]

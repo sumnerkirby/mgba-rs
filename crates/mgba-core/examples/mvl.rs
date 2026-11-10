@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 //! Replays mGBA video logs (`test.mvl`) through the software renderer and
 //! compares the frames to the cinema baselines, the way mGBA's video-log
 //! playback core (src/gba/core.c `_GBAVLP*`, src/gba/extra/proxy.c) does.

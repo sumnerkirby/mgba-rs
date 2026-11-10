@@ -119,7 +119,7 @@ const REGISTER_MASK: [u8; 0x100] = register_mask();
 
 pub const SIO_CYCLES_PER_TRANSFER: [i32; 2] = [512, 16];
 
-/// `struct GBSIO` (no link cable driver)
+/// `struct GBSIO` (the driver is [`Gb::sio_driver`])
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub struct GbSio {
     pub next_event: i32,
@@ -504,6 +504,8 @@ impl Gb {
     pub(crate) fn sio_reset(&mut self) {
         self.sio.next_event = i32::MAX;
         self.sio.remaining_bits = 0;
+        let driver = self.sio_driver.clone();
+        self.sio_set_driver(driver);
     }
 
     /// `_GBSIOProcessEvents`
@@ -529,8 +531,13 @@ impl Gb {
         }
     }
 
-    /// `GBSIOWriteSB` (no driver attached)
-    fn sio_write_sb(&mut self, _sb: u8) {}
+    /// `GBSIOWriteSB`
+    fn sio_write_sb(&mut self, sb: u8) {
+        if self.sio_driver.is_none() {
+            return;
+        }
+        self.sio_lockstep_write_sb(sb);
+    }
 
     /// `GBSIOWriteSC`
     fn sio_write_sc(&mut self, sc: u8) {
@@ -545,5 +552,70 @@ impl Gb {
         } else {
             self.deschedule(GbEvent::Sio);
         }
+        if self.sio_driver.is_some() {
+            self.sio_lockstep_write_sc(sc);
+        }
     }
 }
+
+/// `GBIORegisterNames`: register names for the debugger's identifier lookup.
+pub const IO_REGISTER_NAMES: &[(&str, usize)] = &[
+    ("JOYP", REG_JOYP),
+    ("SB", REG_SB),
+    ("SC", REG_SC),
+    ("DIV", REG_DIV),
+    ("TIMA", REG_TIMA),
+    ("TMA", REG_TMA),
+    ("TAC", REG_TAC),
+    ("IF", REG_IF),
+    ("NR10", REG_NR10),
+    ("NR11", REG_NR11),
+    ("NR12", REG_NR12),
+    ("NR13", REG_NR13),
+    ("NR14", REG_NR14),
+    ("NR21", REG_NR21),
+    ("NR22", REG_NR22),
+    ("NR23", REG_NR23),
+    ("NR24", REG_NR24),
+    ("NR30", REG_NR30),
+    ("NR31", REG_NR31),
+    ("NR32", REG_NR32),
+    ("NR33", REG_NR33),
+    ("NR34", REG_NR34),
+    ("NR41", REG_NR41),
+    ("NR42", REG_NR42),
+    ("NR43", REG_NR43),
+    ("NR44", REG_NR44),
+    ("NR50", REG_NR50),
+    ("NR51", REG_NR51),
+    ("NR52", REG_NR52),
+    ("LCDC", REG_LCDC),
+    ("STAT", REG_STAT),
+    ("SCY", REG_SCY),
+    ("SCX", REG_SCX),
+    ("LY", REG_LY),
+    ("LYC", REG_LYC),
+    ("DMA", REG_DMA),
+    ("BGP", REG_BGP),
+    ("OBP0", REG_OBP0),
+    ("OBP1", REG_OBP1),
+    ("WY", REG_WY),
+    ("WX", REG_WX),
+    ("KEY0", REG_KEY0),
+    ("KEY1", REG_KEY1),
+    ("VBK", REG_VBK),
+    ("BANK", REG_BANK),
+    ("HDMA1", REG_HDMA1),
+    ("HDMA2", REG_HDMA2),
+    ("HDMA3", REG_HDMA3),
+    ("HDMA4", REG_HDMA4),
+    ("HDMA5", REG_HDMA5),
+    ("RP", REG_RP),
+    ("BCPS", REG_BCPS),
+    ("BCPD", REG_BCPD),
+    ("OCPS", REG_OCPS),
+    ("OCPD", REG_OCPD),
+    ("OPRI", REG_OPRI),
+    ("SVBK", REG_SVBK),
+    ("IE", REG_IE),
+];
