@@ -14,9 +14,9 @@ mgba-master/
 *.7z
 *.sav
 *.ss[0-9]
+*.mvl
 gba_bios.bin
 gb_bios.bin
 gbc_bios.bin
 sgb_bios.bin
 *.cheats
-

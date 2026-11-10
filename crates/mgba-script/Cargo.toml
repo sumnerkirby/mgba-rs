@@ -4,6 +4,7 @@ description = "Lua scripting for the Rust mGBA port, with mGBA's script API"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 mgba-core = { path = "../mgba-core" }

@@ -6,6 +6,7 @@ members = ["crates/mgba-core", "crates/mgba-gui", "crates/mgba-script"]
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
+repository = "https://github.com/sumnerkirby/mgba-rs"
 
 [profile.release]
 opt-level = 3

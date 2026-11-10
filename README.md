@@ -28,7 +28,7 @@ mGBA-rs is not affiliated with or endorsed by mGBA or its authors. Please report
 | `crates/mgba-core/src/gba/mgba_state.rs`, `state_container.rs` | mGBA's GBA save-state format and container (`src/gba/serialize.c`, `src/core/serialize.c`) |
 | `crates/mgba-script` | Lua scripting with mGBA's script API (mlua with a vendored Lua 5.4) |
 | `crates/mgba-gui` | `mgba-rs`, the desktop app (egui/eframe) |
-| `mgba-master/` | The original mGBA source, kept for reference and for its test data |
+| `mgba-master/` | The original mGBA source, used for reference and test data (not included; see [Testing](#testing)) |
 
 ## Building and running
 
@@ -137,11 +137,17 @@ See [TODO.md](TODO.md) for what isn't ported yet.
 
 ## Testing
 
-mGBA ships a regression suite in `mgba-master/cinema`: test ROMs with expected screenshots, and recorded video logs (`.mvl`) of real games that exercise the renderer. With `mgba-master/` next to the workspace:
+mGBA ships a regression suite in `mgba-master/cinema`: test ROMs with expected screenshots, and recorded video logs (`.mvl`) of real games that exercise the renderer. It isn't part of this repository; clone mGBA into `mgba-master/` at the top of the workspace:
+
+```bash
+git clone https://github.com/mgba-emu/mgba.git mgba-master
+```
 
 ```bash
 cargo test --release
 ```
+
+Without `mgba-master/`, the tests that need mGBA's test data print a note and skip; everything else still runs.
 
 This runs every GBA ROM test and every video log and requires a pixel-exact match with mGBA's baselines (currently 3 ROM tests and 23 video logs, all passing), plus a save-state determinism check.
 
