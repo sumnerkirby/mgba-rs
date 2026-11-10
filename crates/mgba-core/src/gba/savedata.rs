@@ -325,7 +325,7 @@ impl Savedata {
         settle
     }
 
-    fn flash_switch_bank(&mut self, bank: usize) {
+    pub(crate) fn flash_switch_bank(&mut self, bank: usize) {
         if bank > 0 && self.ty == SavedataType::Flash512 {
             // Updating flash chip from 512kb to 1Mb
             self.ty = SavedataType::Flash1M;

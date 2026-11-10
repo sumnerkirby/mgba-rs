@@ -12,6 +12,7 @@ pub mod gpio;
 pub mod io;
 pub mod mcore;
 pub mod memory;
+pub mod mgba_state;
 pub mod overrides;
 pub mod psg;
 pub mod regs;

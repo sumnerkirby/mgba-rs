@@ -221,7 +221,7 @@ impl Gba {
     }
 
     /// `_calculateStallMask`
-    fn calculate_stall_mask(&self, dispcnt: u16) -> u32 {
+    pub(crate) fn calculate_stall_mask(&self, dispcnt: u16) -> u32 {
         let mut mask: u32 = 0;
         if dispcnt & 0x80 != 0 {
             return 0;

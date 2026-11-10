@@ -242,10 +242,23 @@ impl Core {
         }
     }
 
+    /// Load a state in this port's format, or (GBA) mGBA's own.
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
         match self {
-            Core::Gba(g) => g.load_state(data).map_err(|e| e.to_string()),
+            Core::Gba(g) => match g.load_state(data) {
+                Ok(()) => Ok(()),
+                Err(mgba_core::gba::serialize::StateError::BadMagic) => g.load_state_mgba(data),
+                Err(e) => Err(e.to_string()),
+            },
             Core::Gb(g) => g.load_state(data).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// A state in mGBA's format (GBA only so far).
+    pub fn save_state_mgba(&mut self) -> Result<Vec<u8>, String> {
+        match self {
+            Core::Gba(g) => Ok(g.save_state_mgba()),
+            Core::Gb(_) => Err("mGBA-format states are only supported for GBA games so far".into()),
         }
     }
 

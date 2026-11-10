@@ -856,6 +856,46 @@ impl App {
         }
     }
 
+    /// Load a save state file from mGBA (or this port) chosen by the user.
+    fn import_state_dialog(&mut self) {
+        let Some(emu) = &mut self.emu else { return };
+        let mut dialog = rfd::FileDialog::new().set_title("Load save state (mGBA or mGBA-rs)");
+        if let Some(dir) = emu.rom_path.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_file() else { return };
+        let result = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|d| emu.core.load_state(&d));
+        match result {
+            Ok(()) => self.set_status(format!("Loaded {}", path.display())),
+            Err(e) => self.error = Some(format!("Couldn't load {}: {e}", path.display())),
+        }
+    }
+
+    /// Save a state in mGBA's format, for mGBA to load.
+    fn export_mgba_state_dialog(&mut self) {
+        let Some(emu) = &mut self.emu else { return };
+        let data = match emu.core.save_state_mgba() {
+            Ok(d) => d,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        let name = emu.rom_path.with_extension("ss1");
+        let mut dialog = rfd::FileDialog::new().set_title("Save state for mGBA");
+        if let Some(dir) = emu.rom_path.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(file) = name.file_name() {
+            dialog = dialog.set_file_name(file.to_string_lossy());
+        }
+        let Some(path) = dialog.save_file() else { return };
+        match std::fs::write(&path, data) {
+            Ok(()) => self.set_status(format!("Saved mGBA state to {}", path.display())),
+            Err(e) => self.error = Some(format!("Couldn't write {}: {e}", path.display())),
+        }
+    }
+
     fn screenshot(&mut self) {
         let Some(emu) = &self.emu else { return };
         let stem = emu.rom_path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "screenshot".into());
@@ -1243,6 +1283,15 @@ impl App {
                             }
                         }
                     });
+                    if ui.button("Load state file… (mGBA or mGBA-rs)").clicked() {
+                        ui.close();
+                        self.import_state_dialog();
+                    }
+                    let gba = matches!(self.emu.as_ref().map(|e| e.core.platform()), Some(Platform::Gba));
+                    if ui.add_enabled(gba, egui::Button::new("Save state for mGBA…")).clicked() {
+                        ui.close();
+                        self.export_mgba_state_dialog();
+                    }
                     if ui.add(egui::Button::new("Take screenshot").shortcut_text("F12")).clicked() {
                         ui.close();
                         self.screenshot();
