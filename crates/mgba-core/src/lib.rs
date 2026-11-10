@@ -8,6 +8,7 @@ pub mod arm;
 pub mod cheats;
 pub mod gb;
 pub mod gba;
+pub mod lockstep;
 pub mod sm83;
 pub mod timing;
 

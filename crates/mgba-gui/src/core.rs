@@ -5,10 +5,12 @@
 //! file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use mgba_core::gb::{self, model};
-use mgba_core::gba::{self, LogLevel};
 use mgba_core::cheats::{CheatDevice, CheatSet};
+use mgba_core::gb::{self, model, GbSioLockstep};
+use mgba_core::gba::{self, GbaSioLockstepCoordinator, LogLevel};
+use mgba_core::lockstep;
 use mgba_core::{Gb, Gba};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,7 +40,84 @@ pub enum Core {
     Gb(Box<Gb>),
 }
 
+/// A link cable between cores of one platform (the lockstep half of mGBA's
+/// `MultiplayerController`).
+pub enum LinkCable {
+    Gba(Arc<Mutex<GbaSioLockstepCoordinator>>),
+    Gb(Arc<Mutex<GbSioLockstep>>),
+}
+
+impl LinkCable {
+    pub fn new(platform: Platform) -> LinkCable {
+        match platform {
+            Platform::Gba => LinkCable::Gba(GbaSioLockstepCoordinator::new()),
+            Platform::Gb => LinkCable::Gb(GbSioLockstep::new()),
+        }
+    }
+}
+
+/// Run linked cores for one frame each. They must all be the cable's platform.
+pub fn run_linked_frame(cores: &mut [&mut Core]) {
+    let ok = if cores.iter().all(|c| matches!(c, Core::Gba(_))) {
+        let mut v: Vec<&mut Gba> = cores
+            .iter_mut()
+            .map(|c| match &mut **c {
+                Core::Gba(g) => g.as_mut(),
+                Core::Gb(_) => unreachable!(),
+            })
+            .collect();
+        lockstep::run_linked_frame(&mut v)
+    } else if cores.iter().all(|c| matches!(c, Core::Gb(_))) {
+        let mut v: Vec<&mut Gb> = cores
+            .iter_mut()
+            .map(|c| match &mut **c {
+                Core::Gb(g) => g.as_mut(),
+                Core::Gba(_) => unreachable!(),
+            })
+            .collect();
+        lockstep::run_linked_frame(&mut v)
+    } else {
+        false
+    };
+    if !ok {
+        // The link stalled; keep everyone moving rather than freezing the window.
+        for c in cores.iter_mut() {
+            c.run_frame();
+        }
+    }
+}
+
 impl Core {
+    pub fn platform(&self) -> Platform {
+        match self {
+            Core::Gba(_) => Platform::Gba,
+            Core::Gb(_) => Platform::Gb,
+        }
+    }
+
+    /// Plug this core into `cable` as player `player` (0-based). Returns false
+    /// if the platforms differ or the cable is full.
+    pub fn attach_link(&mut self, cable: &LinkCable, player: i32) -> bool {
+        match (self, cable) {
+            (Core::Gba(g), LinkCable::Gba(c)) => {
+                if c.lock().unwrap().attached() >= gba::sio_lockstep::MAX_GBAS {
+                    return false;
+                }
+                g.attach_link(c, Some(player));
+                true
+            }
+            (Core::Gb(g), LinkCable::Gb(l)) => g.attach_link(l),
+            _ => false,
+        }
+    }
+
+    pub fn detach_link(&mut self) {
+        match self {
+            Core::Gba(g) => g.detach_link(),
+            Core::Gb(g) => g.detach_link(),
+        }
+    }
+
     pub fn screen_size(&self) -> [usize; 2] {
         match self {
             Core::Gba(_) => [gba::VIDEO_HORIZONTAL_PIXELS, gba::VIDEO_VERTICAL_PIXELS],

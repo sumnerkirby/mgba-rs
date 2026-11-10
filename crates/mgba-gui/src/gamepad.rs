@@ -102,6 +102,19 @@ impl Gamepads {
         }
     }
 
+    /// Pressed button codes of each controller separately, as of the last
+    /// [`Gamepads::poll`] (for giving a second player their own controller).
+    pub fn pressed_per_pad(&self) -> Vec<Vec<u16>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.per_pad.clone()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Names of connected controllers.
     pub fn connected(&self) -> Vec<String> {
         #[cfg(target_os = "linux")]
@@ -191,6 +204,7 @@ mod linux {
     pub struct Pads {
         pads: Vec<Pad>,
         last_scan: Option<Instant>,
+        pub per_pad: Vec<Vec<u16>>,
     }
 
     fn test_bit(bits: &[u8], bit: usize) -> bool {
@@ -306,7 +320,9 @@ mod linux {
                 self.pads.remove(i);
             }
             let mut pressed: Vec<u16> = vec![];
+            self.per_pad.clear();
             for pad in &self.pads {
+                let start = pressed.len();
                 pressed.extend(pad.buttons.iter().copied());
                 let dir = |a: &Option<Axis>| a.as_ref().map(|a| a.direction()).unwrap_or(0);
                 let x = dir(&pad.axes[2]) + dir(&pad.axes[0]);
@@ -323,6 +339,7 @@ mod linux {
                 if x > 0 {
                     pressed.push(DIRS[3]);
                 }
+                self.per_pad.push(pressed[start..].to_vec());
             }
             (pressed, newly)
         }

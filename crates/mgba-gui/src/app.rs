@@ -10,7 +10,7 @@ use mgba_core::{Gb, Gba};
 use serde::{Deserialize, Serialize};
 
 use crate::audio::{AudioOut, Resampler};
-use crate::core::{detect_platform, Core, Platform};
+use crate::core::{detect_platform, run_linked_frame, Core, LinkCable, Platform};
 use crate::gamepad::{self, Gamepads};
 use crate::rewind::{Rewind, Snapshot};
 
@@ -109,6 +109,8 @@ pub struct Settings {
     pub sgb_borders: bool,
     pub skip_bios: bool,
     pub keymap: Vec<(Button, Key)>,
+    /// Player 2's keyboard layout, used while a second player is linked.
+    pub keymap_p2: Vec<(Button, Key)>,
     /// Controller bindings: button -> Linux input event code.
     pub pad_map: Vec<(Button, u16)>,
     pub recent_roms: Vec<PathBuf>,
@@ -147,6 +149,18 @@ impl Default for Settings {
                 (Button::Start, Key::Enter),
                 (Button::Select, Key::Backspace),
             ],
+            keymap_p2: vec![
+                (Button::Up, Key::I),
+                (Button::Down, Key::K),
+                (Button::Left, Key::J),
+                (Button::Right, Key::L),
+                (Button::A, Key::M),
+                (Button::B, Key::N),
+                (Button::L, Key::U),
+                (Button::R, Key::O),
+                (Button::Start, Key::P),
+                (Button::Select, Key::Y),
+            ],
             pad_map: gamepad::default_mapping(),
             recent_roms: Vec::new(),
             fast_forward_multiplier: 4,
@@ -159,14 +173,31 @@ impl Default for Settings {
 }
 
 impl Settings {
-    fn key_for(&self, b: Button) -> Option<Key> {
-        self.keymap.iter().find(|(btn, _)| *btn == b).map(|(_, k)| *k)
+    fn keymap_mut(&mut self, player: usize) -> &mut Vec<(Button, Key)> {
+        if player == 0 {
+            &mut self.keymap
+        } else {
+            &mut self.keymap_p2
+        }
     }
 
-    fn set_key(&mut self, b: Button, key: Key) {
-        self.keymap.retain(|(btn, _)| *btn != b);
-        self.keymap.push((b, key));
+    fn key_for(&self, player: usize, b: Button) -> Option<Key> {
+        let map = if player == 0 { &self.keymap } else { &self.keymap_p2 };
+        map.iter().find(|(btn, _)| *btn == b).map(|(_, k)| *k)
     }
+
+    fn set_key(&mut self, player: usize, b: Button, key: Key) {
+        let map = self.keymap_mut(player);
+        map.retain(|(btn, _)| *btn != b);
+        map.push((b, key));
+    }
+}
+
+/// A second player on a link cable (mGBA's `MultiplayerController` with two
+/// games attached), shown beside player 1.
+struct Link {
+    cable: LinkCable,
+    p2: Emulator,
 }
 
 struct Emulator {
@@ -240,9 +271,12 @@ pub struct App {
     status: Option<(String, Instant)>,
     error: Option<String>,
     show_keymap: bool,
-    rebinding: Option<Button>,
+    /// Keyboard key being rebound: (player, button).
+    rebinding: Option<(usize, Button)>,
     rebinding_pad: Option<Button>,
     gamepads: Gamepads,
+    link: Option<Link>,
+    texture_p2: Option<TextureHandle>,
     rewind: Rewind,
     rewind_tick: u32,
     rewinding: bool,
@@ -260,7 +294,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, rom: Option<PathBuf>) -> App {
+    /// `rom` is loaded for player 1; `link` (`Some(None)` for the same game)
+    /// starts a linked player 2.
+    pub fn new(cc: &eframe::CreationContext<'_>, rom: Option<PathBuf>, link: Option<Option<PathBuf>>) -> App {
         let settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
@@ -284,6 +320,8 @@ impl App {
             rebinding: None,
             rebinding_pad: None,
             gamepads: Gamepads::new(),
+            link: None,
+            texture_p2: None,
             rewind: Rewind::new(1),
             rewind_tick: 0,
             rewinding: false,
@@ -303,6 +341,9 @@ impl App {
         }
         if let Some(path) = rom {
             app.load_rom(&cc.egui_ctx, &path);
+            if let Some(p2) = link {
+                app.start_player2(&cc.egui_ctx, p2);
+            }
         }
         app
     }
@@ -425,10 +466,98 @@ impl App {
     }
 
     fn close_rom(&mut self) {
+        self.stop_player2();
         if let Some(mut emu) = self.emu.take() {
             if let Err(e) = emu.write_save() {
                 self.error = Some(format!("Couldn't write save file {}: {e}", emu.save_path.display()));
             }
+        }
+    }
+
+    // ----- Link cable -----
+
+    /// Start a second player linked to the first, running `path` (or player
+    /// 1's game). Like mGBA, a second copy of the same game gets its own save
+    /// file (`.sa2`).
+    fn start_player2(&mut self, ctx: &egui::Context, path: Option<PathBuf>) {
+        let Some(p1) = &self.emu else { return };
+        if self.link.is_some() {
+            return;
+        }
+        let path = path.unwrap_or_else(|| p1.rom_path.clone());
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.error = Some(format!("Couldn't read {}: {e}", path.display()));
+                return;
+            }
+        };
+        let platform = p1.core.platform();
+        if detect_platform(&path, &data) != Some(platform) {
+            let what = match platform {
+                Platform::Gba => "Game Boy Advance",
+                Platform::Gb => "Game Boy",
+            };
+            self.error = Some(format!("Player 2 needs a {what} game to link with player 1"));
+            return;
+        }
+        let save_path = if path == p1.rom_path { path.with_extension("sa2") } else { path.with_extension("sav") };
+        let save = std::fs::read(&save_path).ok();
+        let core = match platform {
+            Platform::Gba => self.make_gba(data, save.as_deref()),
+            Platform::Gb => self.make_gb(data, save.as_deref()),
+        };
+        let Some(core) = core else {
+            self.error = Some(format!("Couldn't load {}", path.display()));
+            return;
+        };
+        let mut title = core.game_title();
+        if title.is_empty() {
+            title = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        }
+        let mut p2 = Emulator { core, rom_path: path, save_path, title };
+        let cable = LinkCable::new(platform);
+        let p1 = self.emu.as_mut().unwrap();
+        if !p1.core.attach_link(&cable, 0) || !p2.core.attach_link(&cable, 1) {
+            p1.core.detach_link();
+            self.error = Some("Couldn't connect the link cable".into());
+            return;
+        }
+        // States and rewind would desynchronize the two sides.
+        self.rewind.clear();
+        self.shown_frame = None;
+        let title = p2.title.clone();
+        self.link = Some(Link { cable, p2 });
+        let [w, h] = self.emu.as_ref().unwrap().core.screen_size();
+        let s = self.settings.scale;
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w as f32 * s * 2.0, h as f32 * s + 68.0)));
+        self.set_status(format!("Player 2 connected: {title}"));
+    }
+
+    /// Disconnect player 2 and write its save.
+    fn stop_player2(&mut self) {
+        let Some(mut link) = self.link.take() else { return };
+        if let Err(e) = link.p2.write_save() {
+            self.error = Some(format!("Couldn't write save file {}: {e}", link.p2.save_path.display()));
+        }
+        link.p2.core.detach_link();
+        if let Some(emu) = &mut self.emu {
+            emu.core.detach_link();
+        }
+        drop(link.cable);
+        self.texture_p2 = None;
+        self.set_status("Player 2 disconnected");
+    }
+
+    fn open_player2_dialog(&mut self, ctx: &egui::Context) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Open ROM for player 2")
+            .add_filter("Game Boy / Game Boy Advance ROM", &["gba", "agb", "bin", "gb", "gbc", "sgb", "cgb"]);
+        if let Some(dir) = self.emu.as_ref().and_then(|e| e.rom_path.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.start_player2(ctx, Some(path));
         }
     }
 
@@ -483,6 +612,10 @@ impl App {
     }
 
     fn save_state(&mut self, slot: u32) {
+        if self.link.is_some() {
+            self.set_status("Save states are off while player 2 is linked");
+            return;
+        }
         let Some(emu) = &self.emu else { return };
         let path = emu.state_path(slot);
         match std::fs::write(&path, emu.core.save_state()) {
@@ -492,6 +625,10 @@ impl App {
     }
 
     fn load_state(&mut self, slot: u32) {
+        if self.link.is_some() {
+            self.set_status("Save states are off while player 2 is linked");
+            return;
+        }
         let Some(emu) = &mut self.emu else { return };
         let path = emu.state_path(slot);
         let result = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|d| emu.core.load_state(&d));
@@ -537,6 +674,9 @@ impl App {
     fn reset(&mut self) {
         if let Some(emu) = &mut self.emu {
             emu.core.reset();
+            if let Some(link) = &mut self.link {
+                link.p2.core.reset();
+            }
             self.shown_frame = None;
             self.set_status("Reset");
         }
@@ -544,29 +684,36 @@ impl App {
 
     // ----- Emulation -----
 
-    fn read_keys(&mut self, ctx: &egui::Context) -> u16 {
+    /// Keys held for player 1 and player 2.
+    fn read_keys(&mut self, ctx: &egui::Context) -> (u16, u16) {
         let (pressed, newly) = self.gamepads.poll();
         self.pad_pressed = pressed;
         if let (Some(button), Some(c)) = (self.rebinding_pad, newly) {
             self.settings.pad_map.retain(|(b, _)| *b != button);
             self.settings.pad_map.push((button, c));
             self.rebinding_pad = None;
-            return 0;
+            return (0, 0);
         }
         if self.rebinding.is_some() || self.rebinding_pad.is_some() {
-            return 0;
+            return (0, 0);
         }
-        let pad = Gamepads::keys(&self.pad_pressed, &self.settings.pad_map);
+        // With a second player and two controllers, the second one is theirs.
+        let per_pad = self.gamepads.pressed_per_pad();
+        let (pad1, pad2) = if self.link.is_some() && per_pad.len() >= 2 {
+            let map = &self.settings.pad_map;
+            let rest: Vec<u16> = per_pad.iter().enumerate().filter(|(i, _)| *i != 1).flat_map(|(_, p)| p.iter().copied()).collect();
+            (Gamepads::keys(&rest, map), Gamepads::keys(&per_pad[1], map))
+        } else {
+            (Gamepads::keys(&self.pad_pressed, &self.settings.pad_map), 0)
+        };
         if ctx.memory(|m| m.focused().is_some()) {
-            return pad;
+            return (pad1, pad2);
         }
-        pad | ctx.input(|i| {
-            self.settings
-                .keymap
-                .iter()
-                .filter(|(_, k)| i.key_down(*k))
-                .fold(0u16, |acc, (b, _)| acc | b.bit())
-        })
+        let held = |map: &[(Button, Key)]| {
+            ctx.input(|i| map.iter().filter(|(_, k)| i.key_down(*k)).fold(0u16, |acc, (b, _)| acc | b.bit()))
+        };
+        let p2 = if self.link.is_some() { held(&self.settings.keymap_p2) } else { 0 };
+        (pad1 | held(&self.settings.keymap), pad2 | p2)
     }
 
     fn run_emulation(&mut self, ctx: &egui::Context) {
@@ -577,7 +724,7 @@ impl App {
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         let running = self.emu.is_some() && !self.paused && !(self.settings.pause_when_unfocused && !focused);
         // Poll input even while stopped so controller rebinding works.
-        let keys = self.read_keys(ctx);
+        let (keys, keys_p2) = self.read_keys(ctx);
         if !running {
             self.acc = 0.0;
             if self.rebinding_pad.is_some() {
@@ -587,6 +734,7 @@ impl App {
         }
 
         let rewind_held = self.settings.rewind_enabled
+            && self.link.is_none()
             && self.rebinding.is_none()
             && ctx.memory(|m| m.focused().is_none())
             && ctx.input(|i| i.key_down(Key::Backtick));
@@ -646,9 +794,19 @@ impl App {
         if frames > 0 {
             self.shown_frame = None;
         }
+        if let Some(link) = &mut self.link {
+            link.p2.core.set_keys(keys_p2);
+        }
         for _ in 0..frames {
-            emu.core.run_frame();
-            if self.settings.rewind_enabled {
+            if let Some(link) = &mut self.link {
+                run_linked_frame(&mut [&mut emu.core, &mut link.p2.core]);
+                // Only player 1 is heard.
+                let mut discard = Vec::new();
+                link.p2.core.drain_audio(&mut discard);
+            } else {
+                emu.core.run_frame();
+            }
+            if self.settings.rewind_enabled && self.link.is_none() {
                 self.rewind_tick += 1;
                 if self.rewind_tick >= REWIND_INTERVAL {
                     self.rewind_tick = 0;
@@ -663,6 +821,18 @@ impl App {
         if emu.core.take_savedata_updated() {
             if let Err(e) = emu.write_save() {
                 self.error = Some(format!("Couldn't write save file: {e}"));
+            }
+        }
+        if let Some(link) = &mut self.link {
+            if link.p2.core.take_savedata_updated() {
+                if let Err(e) = link.p2.write_save() {
+                    self.error = Some(format!("Couldn't write player 2's save file: {e}"));
+                }
+            }
+            for (level, msg) in link.p2.core.drain_log() {
+                if self.show_log && !matches!(level, LogLevel::Debug) {
+                    self.log_lines.push(format!("[P2] [{level:?}] {msg}"));
+                }
             }
         }
         if self.show_log {
@@ -707,12 +877,21 @@ impl App {
             Some(t) => t.set(image, options),
             None => self.texture = Some(ctx.load_texture("screen", image, options)),
         }
+        if let Some(link) = &self.link {
+            let size = link.p2.core.screen_size();
+            let pixels = link.p2.core.framebuffer().iter().map(|&p| Color32::from_rgb(p as u8, (p >> 8) as u8, (p >> 16) as u8)).collect();
+            let image = ColorImage::new(size, pixels);
+            match &mut self.texture_p2 {
+                Some(t) => t.set(image, options),
+                None => self.texture_p2 = Some(ctx.load_texture("screen-p2", image, options)),
+            }
+        }
     }
 
     // ----- Input / hotkeys -----
 
     fn handle_hotkeys(&mut self, ctx: &egui::Context) {
-        if let Some(button) = self.rebinding {
+        if let Some((player, button)) = self.rebinding {
             let pressed = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
                     egui::Event::Key { key, pressed: true, .. } => Some(*key),
@@ -721,7 +900,7 @@ impl App {
             });
             if let Some(key) = pressed {
                 if key != Key::Escape {
-                    self.settings.set_key(button, key);
+                    self.settings.set_key(player, button, key);
                 }
                 self.rebinding = None;
             }
@@ -910,6 +1089,25 @@ impl App {
                 });
             });
 
+            ui.menu_button("Link", |ui| {
+                let has = self.emu.is_some();
+                let linked = self.link.is_some();
+                if ui.add_enabled(has && !linked, egui::Button::new("Start player 2 with this game")).clicked() {
+                    ui.close();
+                    self.start_player2(&ctx, None);
+                }
+                if ui.add_enabled(has && !linked, egui::Button::new("Start player 2 with another game…")).clicked() {
+                    ui.close();
+                    self.open_player2_dialog(&ctx);
+                }
+                if ui.add_enabled(linked, egui::Button::new("Disconnect player 2")).clicked() {
+                    ui.close();
+                    self.stop_player2();
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("Player 2 runs beside player 1 on a link cable.\nKeys: Settings → Controls.").small());
+            });
+
             ui.menu_button("Video", |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Window size:");
@@ -1022,6 +1220,9 @@ impl App {
                     if let Some(emu) = &mut self.emu {
                         emu.core.set_log_enabled(self.show_log);
                     }
+                    if let Some(link) = &mut self.link {
+                        link.p2.core.set_log_enabled(self.show_log);
+                    }
                 }
             });
 
@@ -1034,19 +1235,36 @@ impl App {
         });
     }
 
-    fn screen(&mut self, ui: &mut egui::Ui) {
-        let available = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(available, 0.0, Color32::BLACK);
-        let Some(tex) = &self.texture else { return };
-        let [w, h] = self.emu.as_ref().map(|e| e.core.screen_size()).unwrap_or([GBA_W, GBA_H]);
-        let mut scale = (available.width() / w as f32).min(available.height() / h as f32);
+    /// Fit a `w`×`h` screen in `area`, centred.
+    fn fit(&self, area: egui::Rect, w: usize, h: usize) -> egui::Rect {
+        let mut scale = (area.width() / w as f32).min(area.height() / h as f32);
         if self.settings.integer_scaling && scale >= 1.0 {
             scale = scale.floor();
         }
-        let size = egui::vec2(w as f32 * scale, h as f32 * scale);
-        let rect = egui::Rect::from_center_size(available.center(), size);
+        egui::Rect::from_center_size(area.center(), egui::vec2(w as f32 * scale, h as f32 * scale))
+    }
+
+    fn screen(&mut self, ui: &mut egui::Ui) {
+        let mut available = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(available, 0.0, Color32::BLACK);
+        let Some(tex) = &self.texture else { return };
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        if let (Some(link), Some(tex2)) = (&self.link, &self.texture_p2) {
+            // Player 2 gets the right half of the window.
+            let (left, right) = available.split_left_right_at_fraction(0.5);
+            available = left;
+            let [w, h] = link.p2.core.screen_size();
+            let rect = self.fit(right, w, h);
+            ui.painter().image(tex2.id(), rect, uv, Color32::WHITE);
+            let label = egui::FontId::proportional(13.0);
+            let faint = Color32::from_rgba_unmultiplied(255, 255, 255, 160);
+            ui.painter().text(right.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, "P2", label.clone(), faint);
+            ui.painter().text(left.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, "P1", label, faint);
+        }
+        let [w, h] = self.emu.as_ref().map(|e| e.core.screen_size()).unwrap_or([GBA_W, GBA_H]);
+        let rect = self.fit(available, w, h);
         if self.emu.is_some() {
-            ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
             if self.rewinding {
                 ui.painter().text(
                     rect.left_top() + egui::vec2(8.0, 6.0),
@@ -1081,6 +1299,10 @@ impl App {
                     ui.separator();
                 }
                 ui.label(emu.core.cart_info());
+                if let Some(link) = &self.link {
+                    ui.separator();
+                    ui.label(format!("Linked with player 2: {}", link.p2.title));
+                }
             }
             if let Some((msg, at)) = &self.status {
                 if at.elapsed() < Duration::from_secs(4) {
@@ -1185,16 +1407,17 @@ impl App {
                     ui.strong("Button");
                     ui.strong("Keyboard");
                     ui.strong("Controller");
+                    ui.strong("Player 2 keyboard");
                     ui.end_row();
                     for b in Button::ALL {
                         ui.label(b.name());
-                        let label = if self.rebinding == Some(b) {
+                        let label = if self.rebinding == Some((0, b)) {
                             "Press a key… (Esc cancels)".to_string()
                         } else {
-                            self.settings.key_for(b).map(|k| k.name().to_string()).unwrap_or_else(|| "—".into())
+                            self.settings.key_for(0, b).map(|k| k.name().to_string()).unwrap_or_else(|| "—".into())
                         };
                         if ui.button(label).clicked() {
-                            self.rebinding = Some(b);
+                            self.rebinding = Some((0, b));
                             self.rebinding_pad = None;
                         }
                         let pad_label = if self.rebinding_pad == Some(b) {
@@ -1211,6 +1434,15 @@ impl App {
                             self.rebinding_pad = Some(b);
                             self.rebinding = None;
                         }
+                        let label = if self.rebinding == Some((1, b)) {
+                            "Press a key… (Esc cancels)".to_string()
+                        } else {
+                            self.settings.key_for(1, b).map(|k| k.name().to_string()).unwrap_or_else(|| "—".into())
+                        };
+                        if ui.button(label).clicked() {
+                            self.rebinding = Some((1, b));
+                            self.rebinding_pad = None;
+                        }
                         ui.end_row();
                     }
                 });
@@ -1220,10 +1452,12 @@ impl App {
                 } else {
                     ui.label(format!("Controllers: {}", pads.join(", ")));
                 }
+                ui.label("While player 2 is linked, a second controller plays as player 2.");
                 ui.separator();
                 ui.label("Hold Tab to fast-forward and ` (backtick) to rewind. F1–F9 load and Shift+F1–F9 save states.");
                 if ui.button("Restore defaults").clicked() {
                     self.settings.keymap = Settings::default().keymap;
+                    self.settings.keymap_p2 = Settings::default().keymap_p2;
                     self.settings.pad_map = gamepad::default_mapping();
                 }
             });

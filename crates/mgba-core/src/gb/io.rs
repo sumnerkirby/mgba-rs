@@ -119,7 +119,7 @@ const REGISTER_MASK: [u8; 0x100] = register_mask();
 
 pub const SIO_CYCLES_PER_TRANSFER: [i32; 2] = [512, 16];
 
-/// `struct GBSIO` (no link cable driver)
+/// `struct GBSIO` (the driver is [`Gb::sio_driver`])
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub struct GbSio {
     pub next_event: i32,
@@ -504,6 +504,8 @@ impl Gb {
     pub(crate) fn sio_reset(&mut self) {
         self.sio.next_event = i32::MAX;
         self.sio.remaining_bits = 0;
+        let driver = self.sio_driver.clone();
+        self.sio_set_driver(driver);
     }
 
     /// `_GBSIOProcessEvents`
@@ -529,8 +531,13 @@ impl Gb {
         }
     }
 
-    /// `GBSIOWriteSB` (no driver attached)
-    fn sio_write_sb(&mut self, _sb: u8) {}
+    /// `GBSIOWriteSB`
+    fn sio_write_sb(&mut self, sb: u8) {
+        if self.sio_driver.is_none() {
+            return;
+        }
+        self.sio_lockstep_write_sb(sb);
+    }
 
     /// `GBSIOWriteSC`
     fn sio_write_sc(&mut self, sc: u8) {
@@ -544,6 +551,9 @@ impl Gb {
             }
         } else {
             self.deschedule(GbEvent::Sio);
+        }
+        if self.sio_driver.is_some() {
+            self.sio_lockstep_write_sc(sc);
         }
     }
 }

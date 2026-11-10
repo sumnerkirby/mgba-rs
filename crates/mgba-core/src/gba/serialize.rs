@@ -68,6 +68,7 @@ impl Gba {
         new.memory.full_bios = self.memory.full_bios;
         new.log_enabled = self.log_enabled;
         new.cheats = std::mem::take(&mut self.cheats);
+        new.sio_driver = self.sio_driver.take();
         let mut renderer = std::mem::take(&mut self.renderer);
         let audio_buffer = std::mem::take(&mut self.audio.buffer);
         *self = new;
@@ -90,6 +91,11 @@ impl Gba {
             address += 2;
         }
         self.renderer.write_oam(0);
+        // The link driver's state isn't saved; keep its event running so a
+        // linked core doesn't stall after loading a state saved unlinked.
+        if self.sio_driver.is_some() && !self.timing.is_scheduled(crate::timing::EventId::SioLockstep) {
+            self.schedule(crate::timing::EventId::SioLockstep, 0);
+        }
         Ok(())
     }
 }

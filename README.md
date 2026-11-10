@@ -15,6 +15,7 @@ This is a faithful port: the CPUs, memory maps, scheduler, DMA, timers, audio an
 | `crates/mgba-core/src/sm83` | SM83 (Game Boy CPU) interpreter (`src/sm83/*.c`) |
 | `crates/mgba-core/src/gb` | Game Boy / Color system: memory, MBCs, I/O, timer, PPU timing, software renderer, APU (`src/gb/*.c`) |
 | `crates/mgba-core/src/timing.rs` | The event scheduler both systems share (`src/core/timing.c`) |
+| `crates/mgba-core/src/lockstep.rs` | Link-cable plumbing shared by both systems (`src/core/lockstep.c`) and a runner that steps linked cores together |
 | `crates/mgba-gui` | `mgba-rs`, the desktop app (egui/eframe) |
 | `mgba-master/` | The original mGBA source, kept for reference and for its test data |
 
@@ -45,6 +46,17 @@ You can also start it without arguments and use **File → Open ROM** or drag a 
 
 Keys can be remapped in **Settings → Controls**. Game controllers work too (Linux, read directly from `/dev/input`, no extra libraries): by default the bottom face button is A, the right one is B, the shoulders are L/R and both the d-pad and left stick steer, as in mGBA. Controller buttons can be rebound in the same window.
 
+### Two players (link cable)
+
+**Link → Start player 2 with this game** (or **…with another game**) starts a second Game Boy or GBA in the same window, beside the first, connected by a link cable. Both must be the same system. You can also start it from the command line:
+
+```bash
+./target/release/mgba-rs game.gba --link            # player 2 runs the same game
+./target/release/mgba-rs game.gba --link other.gba  # player 2 runs another game
+```
+
+Player 2's default keys are I/J/K/L for the d-pad, M / N for A / B, U / O for L / R, P for Start and Y for Select (remappable in **Settings → Controls**). With two controllers plugged in, the second one plays as player 2. Only player 1's sound is played. Save states and rewind are off while player 2 is connected, since restoring one side alone would desynchronize the link. When both players run the same game, player 2 keeps its battery save in `<rom name>.sa2`, as mGBA does.
+
 | Action | Shortcut |
 | --- | --- |
 | Open ROM | Ctrl+O |
@@ -74,6 +86,7 @@ Keys can be remapped in **Settings → Controls**. Game controllers work too (Li
 - Audio: the four PSG channels and both Direct Sound FIFOs with mGBA's mixing and SOUNDBIAS resolution handling
 - High-level BIOS emulation (division, sqrt, arctan, affine set-up, LZ77/Huffman/RLE/diff decompression, CpuSet, register RAM reset and more)
 - Cartridge GPIO with the real-time clock, and mGBA's per-game override table (save types, RTC, idle loops)
+- Link cable between 2–4 GBAs in normal (8- and 32-bit) and multiplayer modes, using mGBA's lockstep driver (`src/gba/sio/lockstep.c`). As in mGBA, normal-mode data is passed from each player to the next, so the clock owner reads 0xFF
 - Cheats: mGBA's cheat engine with GameShark / Action Replay v1–v2 (encrypted or raw), Pro Action Replay v3, CodeBreaker (including its encryption) and VBA-style codes, plus ROM patches; the format is detected automatically
 
 ### Game Boy / Game Boy Color
@@ -81,7 +94,7 @@ Keys can be remapped in **Settings → Controls**. Game controllers work too (Li
 - SM83 CPU with mGBA's micro-op (M-cycle) model, including the HALT bug, EI delay and double speed
 - Memory map with OAM DMA bus conflicts, CGB HDMA/GDMA, WRAM banking and open-bus cartridge behavior
 - MBC1 (incl. multicarts), MBC2, MBC3 with RTC, MBC5 (incl. rumble flag), MBC6, MBC7 (EEPROM; no tilt sensor), MMM01, HuC-1, HuC-3 (with clock), TAMA5 (with clock), the Pocket Camera (captures an image supplied by the frontend; the GUI has no camera yet), M161, and the unlicensed Wisdom Tree, PKJD, NT, BBD, Hitek, Li Cheng, GGB-81, Sachen and Sintax mappers, with mGBA's detection and override table
-- Timer with mGBA's DIV/TIMA edge timing, serial port (no link partner)
+- Timer with mGBA's DIV/TIMA edge timing, and the serial port with a link cable between two Game Boys (mGBA's lockstep driver, `src/gb/sio/lockstep.c`, plus the cycle bookkeeping its Qt frontend supplies)
 - PPU mode timing and STAT/LYC interrupts, and the software renderer for DMG and CGB (priorities, banks, flips, window quirks, AGB color correction)
 - Super Game Boy models: palette and attribute commands, VRAM transfers, multiplayer requests and borders (256x224 output with the default or game-supplied border; toggle in the Video menu)
 - APU in DMG and CGB styles (sweep, envelopes, wave RAM quirks, LFSR noise), mixed like mGBA at 131072 Hz and averaged to 32768 Hz for output
@@ -93,10 +106,11 @@ Keys can be remapped in **Settings → Controls**. Game controllers work too (Li
 
 - Rewind (hold `), with history stored as compressed differences between save states so 30 seconds costs tens of megabytes, not hundreds
 - Game controller input and rebinding (Linux)
+- Two linked players side by side, with their own keyboard layout and controller
 
 ## Not ported yet
 
-- Link cable / multiplayer for both systems (serial transfers complete as if nothing is connected), e-Reader, GB Player
+- e-Reader, GB Player, Game Boy Printer, Dolphin/GameCube (JOY bus) and network link play; GBA link-cable state isn't part of save states (mGBA stores the lockstep driver's state in its states)
 - Game Boy: GBX files, a camera source for the Pocket Camera in the GUI
 - Gyro, tilt, solar and rumble sensors (they're recognized, but not driven)
 - GBA cheat "hooks" run at the end of each frame instead of at the hooked address (there are no ROM breakpoints)
@@ -116,7 +130,9 @@ This runs every GBA ROM test and every video log and requires a pixel-exact matc
 
 It also runs the Game Boy ROM tests in `cinema/gb` (blargg, mooneye-gb, acid2, samesuite, ramg-mbc3): 236 tests, of which 148 match mGBA's correct baseline and the other 88 are tests mGBA itself is marked as failing (`fail=1`). For those, 87 match mGBA's recorded wrong output (`xbaseline_*.png`) pixel for pixel, and one has no reference image at all, which mGBA's runner also counts as an expected failure. No test differs from mGBA. The 10 Game Boy video logs in `cinema/gb/window` (including a Super Game Boy one with its border) replay pixel-exactly too.
 
-Headless checks cover GB sound output, battery saves, the MBC3/HuC-3/TAMA5 clock blocks, the newer mappers, the Pocket Camera, cheats in every format, and save states.
+Headless link-cable checks (`tests/link.rs`) connect two Game Boys and two to four GBAs and verify the bytes, words and multiplayer halfwords each side receives, including after a reset and a disconnect.
+
+Other headless checks cover GB sound output, battery saves, the MBC3/HuC-3/TAMA5 clock blocks, the newer mappers, the Pocket Camera, cheats in every format, and save states.
 
 Developer tools live in `crates/mgba-core/examples`:
 
@@ -134,6 +150,10 @@ cargo run --release -p mgba-core --example bench -- game.gba 3000
 
 ```bash
 cargo run --release -p mgba-core --example gb -- game.gb 600 /tmp/frame.png
+```
+
+```bash
+cargo run --release -p mgba-core --example link -- game.gba --players 4 --frames 600
 ```
 
 `trace` and `steptrace` print CPU state per frame or per instruction for debugging.

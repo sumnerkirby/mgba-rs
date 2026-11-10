@@ -43,10 +43,16 @@ impl Gb {
         new.memory.rom = self.memory.rom.clone();
         new.bios = self.bios.take();
         new.cheats = std::mem::take(&mut self.cheats);
+        new.sio_driver = self.sio_driver.take();
         new.log_enabled = self.log_enabled;
         let audio_buffer = std::mem::take(&mut self.audio.buffer);
         *self = new;
         self.audio.buffer = audio_buffer;
+        // The link node's state isn't saved; keep its event running so a
+        // linked core doesn't stall after loading a state saved unlinked.
+        if self.sio_driver.is_some() && !self.timing.is_scheduled(super::GbEvent::SioLockstep) {
+            self.schedule(super::GbEvent::SioLockstep, 0);
+        }
         Ok(())
     }
 }

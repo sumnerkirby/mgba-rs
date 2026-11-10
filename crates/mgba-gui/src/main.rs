@@ -13,7 +13,18 @@ mod rewind;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
-    let rom = std::env::args_os().nth(1).map(PathBuf::from);
+    // mgba-rs [ROM] [--link [PLAYER2_ROM]]
+    let mut rom = None;
+    let mut link: Option<Option<PathBuf>> = None;
+    let mut args = std::env::args_os().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--link" {
+            let p2 = args.next_if(|a| !a.to_string_lossy().starts_with("--")).map(PathBuf::from);
+            link = Some(p2);
+        } else if rom.is_none() {
+            rom = Some(PathBuf::from(arg));
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("mGBA-rs")
@@ -23,5 +34,5 @@ fn main() -> eframe::Result {
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native("mgba-rs", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, rom)))))
+    eframe::run_native("mgba-rs", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, rom, link)))))
 }

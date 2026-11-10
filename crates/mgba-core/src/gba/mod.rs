@@ -18,6 +18,7 @@ pub mod renderer;
 pub mod savedata;
 pub mod serialize;
 pub mod sio;
+pub mod sio_lockstep;
 pub mod timer;
 pub mod video;
 
@@ -29,6 +30,7 @@ pub use memory::Memory;
 pub use renderer::SoftwareRenderer;
 pub use savedata::SavedataType;
 pub use sio::Sio;
+pub use sio_lockstep::{GbaSioDriver, GbaSioLockstepCoordinator};
 pub use timer::Timer;
 pub use video::Video;
 
@@ -95,6 +97,9 @@ pub struct Gba {
     pub renderer: SoftwareRenderer,
     pub audio: Audio,
     pub sio: Sio,
+    /// `sio.driver`: the link cable, when one is attached.
+    #[serde(skip)]
+    pub sio_driver: Option<GbaSioDriver>,
     pub timers: [Timer; 4],
 
     pub bus: u32,
@@ -173,6 +178,7 @@ impl Gba {
             renderer: SoftwareRenderer::new(),
             audio: Audio::new(),
             sio: Sio::default(),
+            sio_driver: None,
             timers: [Timer::default(); 4],
             bus: 0,
             performing_dma: 0,
@@ -277,6 +283,7 @@ impl Gba {
             EventId::Dma => self.dma_event(cycles_late),
             EventId::SavedataDust => {}
             EventId::Sio => self.sio_finish(cycles_late),
+            EventId::SioLockstep => self.sio_lockstep_event(cycles_late),
         }
     }
 

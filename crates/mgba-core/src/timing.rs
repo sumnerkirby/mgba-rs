@@ -20,6 +20,9 @@ pub enum EventId {
     Dma,
     SavedataDust,
     Sio,
+    /// The GBA link-cable driver's event (`GBASIOLockstepDriver::event`); past
+    /// `EVENT_COUNT`, so it has no slot in the saved `Timing::whens`.
+    SioLockstep,
 }
 
 pub const EVENT_COUNT: usize = 11;
@@ -43,6 +46,7 @@ impl EventId {
             EventId::Dma => 0x40,
             EventId::SavedataDust => 0x70,
             EventId::Sio => 0x80,
+            EventId::SioLockstep => 0x80,
         }
     }
 }
@@ -79,6 +83,9 @@ pub struct Timing<E = EventId, const N: usize = EVENT_COUNT> {
     pub global_cycles: u64,
     pub master_cycles: u32,
     /// The `when` field of each event struct; retained after it fires, like mGBA's.
+    /// Events numbered `N` and up (the link-cable drivers, whose event lives in
+    /// the driver struct in mGBA and isn't part of the core's state) aren't kept
+    /// here, so states saved before those events existed still load.
     #[serde(with = "serde_big_array::BigArray")]
     pub whens: [u32; N],
 }
@@ -134,7 +141,9 @@ impl<E: TimingEvent, const N: usize> Timing<E, N> {
             }
         }
         list.insert(pos, Event { id, when: abs });
-        self.whens[id.index()] = abs;
+        if let Some(w) = self.whens.get_mut(id.index()) {
+            *w = abs;
+        }
     }
 
     /// `mTimingDeschedule`
@@ -167,7 +176,11 @@ impl<E: TimingEvent, const N: usize> Timing<E, N> {
 
     /// `mTimingUntil`
     pub fn until(&self, id: E, relative: i32) -> i32 {
-        self.whens[id.index()].wrapping_sub(self.master_cycles).wrapping_sub(relative as u32) as i32
+        let when = match self.whens.get(id.index()) {
+            Some(&w) => w,
+            None => self.event_when(id).unwrap_or(self.master_cycles),
+        };
+        when.wrapping_sub(self.master_cycles).wrapping_sub(relative as u32) as i32
     }
 
     /// Absolute `when` of a scheduled event (for serialization).
