@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 //! Developer tools and the smaller GBA features ported alongside them:
 //! idle-loop detection, AGBPrint, cheat hooks, memory search, the CLI
 //! debugger (GBA and GB) and the GDB stub. ROMs are assembled here.

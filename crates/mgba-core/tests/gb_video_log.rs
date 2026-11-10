@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 //! Replays mGBA's recorded Game Boy video logs (cinema/gb/window/*/test.mvl)
 //! through the GB renderer and checks every frame against mGBA's baselines.
 //! Skipped when the mGBA source tree isn't next to this workspace.

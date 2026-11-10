@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 //! Regression tests against mGBA's own "cinema" suite (ROM tests with
 //! baseline screenshots). They run when the mGBA source tree is checked out
 //! next to this workspace as `mgba-master/`; otherwise they are skipped.
