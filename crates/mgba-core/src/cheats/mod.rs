@@ -6,9 +6,10 @@
 // (`CheatPatch`), then applied once per frame by `CheatDevice::refresh`, as
 // `mCheatRefresh` does from `GBFrameEnded`/`GBAFrameEnded`.
 //
-// One difference: GBA codes with a "hook" (an address the cheat engine should
-// run at) are refreshed at the end of each frame like other codes, because
-// this port has no ROM breakpoints to trap the hook address.
+// GBA codes with a "hook" (an address the cheat engine should run at) are
+// refreshed when the game reaches that address instead of once per frame:
+// a Thumb `BKPT` is patched into the ROM there, as `GBASetBreakpoint` does,
+// and the original instruction runs afterwards (`ARMRunFake`).
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -90,6 +91,14 @@ pub struct CheatSet {
 }
 
 impl CheatSet {
+    /// The GBA hook address of this set, if its codes asked for one.
+    pub fn hook(&self) -> Option<u32> {
+        match &self.kind {
+            SetKind::Gba(st) => st.hook,
+            SetKind::Gb => None,
+        }
+    }
+
     pub fn new_gb(name: &str) -> CheatSet {
         CheatSet { name: name.into(), enabled: true, list: vec![], rom_patches: vec![], lines: vec![], kind: SetKind::Gb }
     }
@@ -162,11 +171,23 @@ struct PatchedMem {
     dirty: bool,
 }
 
+/// `struct GBACheatHook`: the instruction a hook breakpoint replaced.
+/// Sets hooking the same address share it, like mGBA's reference-counted hook.
+#[derive(Clone, Copy, Debug)]
+struct CheatHook {
+    patched_opcode: u32,
+    reentries: i32,
+}
+
+/// The `immediate` of the hook breakpoint (`CPU_COMPONENT_CHEAT_DEVICE`).
+pub const CHEAT_DEVICE_BKPT: u32 = 1;
+
 /// `struct mCheatDevice`
 #[derive(Clone, Debug, Default)]
 pub struct CheatDevice {
     pub sets: Vec<CheatSet>,
     unpatched: HashMap<u32, PatchedMem>,
+    hooks: HashMap<u32, CheatHook>,
     pub button_down: bool,
 }
 
@@ -257,13 +278,23 @@ impl CheatDevice {
             return;
         }
         self.unpatch_rom(bus, index);
+        // GBACheatRemoveSet
+        if let Some(hook) = self.sets[index].hook() {
+            self.remove_breakpoint(bus, hook);
+        }
         self.sets.remove(index);
     }
 
-    /// Undo every ROM patch (before the cheats are thrown away).
+    /// Undo every ROM patch and hook breakpoint (before the cheats are thrown away).
     pub fn unpatch_all<B: CheatBus>(&mut self, bus: &mut B) {
         for i in 0..self.sets.len() {
             self.unpatch_rom(bus, i);
+        }
+        let hooks: Vec<u32> = self.hooks.keys().copied().collect();
+        for address in hooks {
+            if let Some(h) = self.hooks.remove(&address) {
+                bus.raw_write(address, -1, 2, h.patched_opcode);
+            }
         }
     }
 
@@ -274,10 +305,75 @@ impl CheatDevice {
         }
     }
 
+    /// The per-frame refresh of `GBAFrameEnded`: sets without a hook run now;
+    /// hooked sets run from their breakpoint, which is planted here the first
+    /// time (mGBA plants it when the set is added).
+    pub fn refresh_frame<B: CheatBus>(&mut self, bus: &mut B) {
+        for i in 0..self.sets.len() {
+            match self.sets[i].hook() {
+                None => self.refresh(bus, i),
+                Some(hook) => {
+                    if !self.hooks.contains_key(&hook) {
+                        self.add_breakpoint(bus, hook);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `_addBreakpoint` with `GBASetBreakpoint` for a Thumb hook.
+    fn add_breakpoint<B: CheatBus>(&mut self, bus: &mut B, address: u32) {
+        if let Some(h) = self.hooks.get_mut(&address) {
+            h.reentries += 1;
+            if h.reentries > 1 {
+                return;
+            }
+        }
+        let patched_opcode = bus.raw_read(address, -1, 2);
+        bus.raw_write(address, -1, 2, 0xBE00 | (CHEAT_DEVICE_BKPT & 0xFF));
+        let reentries = self.hooks.get(&address).map_or(1, |h| h.reentries);
+        self.hooks.insert(address, CheatHook { patched_opcode, reentries });
+    }
+
+    /// `_removeBreakpoint` with `GBAClearBreakpoint`.
+    fn remove_breakpoint<B: CheatBus>(&mut self, bus: &mut B, address: u32) {
+        let Some(h) = self.hooks.get_mut(&address) else { return };
+        h.reentries -= 1;
+        if h.reentries > 0 {
+            return;
+        }
+        let opcode = h.patched_opcode;
+        self.hooks.remove(&address);
+        bus.raw_write(address, -1, 2, opcode);
+    }
+
+    /// The cheat-device case of `GBABreakpoint`: refresh every set hooked at
+    /// `address` and return the instruction the breakpoint replaced.
+    pub fn hook_hit<B: CheatBus>(&mut self, bus: &mut B, address: u32) -> Option<u32> {
+        let mut hit = false;
+        for i in 0..self.sets.len() {
+            if self.sets[i].hook() == Some(address) {
+                self.refresh(bus, i);
+                hit = true;
+            }
+        }
+        if hit {
+            self.hooks.get(&address).map(|h| h.patched_opcode)
+        } else {
+            None
+        }
+    }
+
     /// `mCheatRefresh`
     pub fn refresh<B: CheatBus>(&mut self, bus: &mut B, set_index: usize) {
         if self.sets[set_index].enabled {
             self.patch_rom(bus, set_index);
+        }
+        // GBACheatRefresh: replant the hook if it was cleared
+        if let Some(hook) = self.sets[set_index].hook() {
+            if self.sets[set_index].enabled && !self.hooks.contains_key(&hook) {
+                self.add_breakpoint(bus, hook);
+            }
         }
         if !self.sets[set_index].enabled {
             self.unpatch_rom(bus, set_index);

@@ -6,9 +6,12 @@
 
 pub mod arm;
 pub mod cheats;
+pub mod core;
+pub mod debugger;
 pub mod gb;
 pub mod gba;
 pub mod lockstep;
+pub mod mem_search;
 pub mod sm83;
 pub mod timing;
 

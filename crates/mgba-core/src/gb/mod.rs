@@ -10,6 +10,7 @@ pub mod audio;
 pub mod io;
 pub mod mbc;
 pub mod mbc_extra;
+pub mod mcore;
 pub mod memory;
 pub mod renderer;
 pub mod serialize;
@@ -189,6 +190,9 @@ pub struct Gb {
     /// `sio.driver`: the link cable, when one is attached.
     #[serde(skip)]
     pub sio_driver: Option<GbSioDriver>,
+    /// The debugger's breakpoints and watchpoints while one is attached.
+    #[serde(skip)]
+    pub debugger: Option<Box<crate::debugger::Platform>>,
     pub model: u8,
 
     pub pristine_rom_size: usize,
@@ -350,6 +354,7 @@ impl Gb {
             audio: GbAudio::new(),
             sio: GbSio::default(),
             sio_driver: None,
+            debugger: None,
             model: model::AUTODETECT,
             pristine_rom_size: 0,
             yanked_rom_size: 0,
@@ -1194,10 +1199,16 @@ impl Sm83Bus for Gb {
     }
     #[inline(always)]
     fn load8(&mut self, address: u16) -> u8 {
+        if self.debugger.is_some() {
+            self.debug_watch(address, crate::debugger::WATCHPOINT_READ, 0);
+        }
         Gb::load8(self, address)
     }
     #[inline(always)]
     fn store8(&mut self, address: u16, value: u8) {
+        if self.debugger.is_some() {
+            self.debug_watch(address, crate::debugger::WATCHPOINT_WRITE, value);
+        }
         Gb::store8(self, address, value)
     }
     #[inline(always)]

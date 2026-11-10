@@ -44,6 +44,7 @@ impl Gb {
         new.bios = self.bios.take();
         new.cheats = std::mem::take(&mut self.cheats);
         new.sio_driver = self.sio_driver.take();
+        new.debugger = self.debugger.take();
         new.log_enabled = self.log_enabled;
         let audio_buffer = std::mem::take(&mut self.audio.buffer);
         *self = new;

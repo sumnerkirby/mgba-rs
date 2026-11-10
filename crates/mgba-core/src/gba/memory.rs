@@ -11,7 +11,10 @@ use super::savedata::{Savedata, SavedataType};
 use super::video::{
     VSTALL_A2, VSTALL_A3, VSTALL_B, vstall_t4, vstall_t8,
 };
-use super::{glog, regs, Gba, LogLevel};
+use super::{glog, regs, Gba, IdleLoopOptimization, LogLevel};
+
+/// `IDLE_LOOP_THRESHOLD`
+const IDLE_LOOP_THRESHOLD: i32 = 10000;
 use crate::arm::{ExecutionMode, ARM_PC, LSM_B, LSM_D, WORD_SIZE_ARM, WORD_SIZE_THUMB};
 use crate::timing::EventId;
 
@@ -31,7 +34,14 @@ pub const REGION_ROM2_EX: u32 = 0xD;
 pub const REGION_SRAM: u32 = 0xE;
 pub const REGION_SRAM_MIRROR: u32 = 0xF;
 
+pub const BASE_BIOS: u32 = 0x00000000;
 pub const BASE_EWRAM: u32 = 0x02000000;
+pub const BASE_IWRAM: u32 = 0x03000000;
+pub const BASE_PALETTE_RAM: u32 = 0x05000000;
+pub const BASE_VRAM: u32 = 0x06000000;
+pub const BASE_OAM: u32 = 0x07000000;
+pub const BASE_ROM1: u32 = 0x0A000000;
+pub const BASE_ROM2: u32 = 0x0C000000;
 pub const BASE_IO: u32 = 0x04000000;
 pub const BASE_ROM0: u32 = 0x08000000;
 pub const BASE_SRAM: u32 = 0x0E000000;
@@ -79,7 +89,33 @@ pub enum FetchRegion {
     Oam,
     Rom,
     Bad,
+    /// mGBA's `_agbPrintFunc` stub (`swi 0xFA; bx lr`) mapped at the AGBPrint flush address.
+    AgbPrintFunc,
 }
+
+/// AGBPrint, the debug-output interface of Nintendo's development cartridges
+/// (`agbPrint*` fields of `struct GBAMemory`). Not part of save states.
+#[derive(Clone, Default)]
+pub struct AgbPrint {
+    pub protect: u16,
+    pub base: u32,
+    /// `agbPrintCtx`: request, bank, get, put
+    pub ctx: [u16; 4],
+    pub buffer: Option<Vec<u8>>,
+    pub buffer_backup: Option<Vec<u8>>,
+    pub protect_backup: u16,
+    pub ctx_backup: [u16; 4],
+    pub func_backup: u32,
+}
+
+pub const SIZE_AGB_PRINT: u32 = 0x10000;
+pub const AGB_PRINT_BASE: u32 = 0x00FD_0000;
+pub const AGB_PRINT_TOP: u32 = 0x00FE_0000;
+pub const AGB_PRINT_PROTECT: u32 = 0x00FE_2FFE;
+pub const AGB_PRINT_STRUCT: u32 = 0x00FE_20F8;
+pub const AGB_PRINT_FLUSH_ADDR: u32 = 0x00FE_209C;
+/// `_agbPrintFunc`: `swi 0xFA; bx lr`
+const AGB_PRINT_FUNC: u32 = 0x4770_DFFA;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Memory {
@@ -115,6 +151,8 @@ pub struct Memory {
 
     pub dma: [Dma; 4],
     pub active_dma: i32,
+    #[serde(skip)]
+    pub agb_print: AgbPrint,
 }
 
 fn empty_rom() -> std::sync::Arc<[u8]> {
@@ -145,6 +183,7 @@ impl Memory {
             bios_prefetch: 0,
             dma: [Dma::default(); 4],
             active_dma: -1,
+            agb_print: AgbPrint::default(),
         };
         for i in 0..16 {
             m.waitstates_nonseq16[i] = BASE_WAITSTATES[i];
@@ -213,8 +252,7 @@ impl Gba {
         self.memory.io = [0; 512];
         self.adjust_waitstates(0);
         self.adjust_ewram_waitstates(0x0D00);
-        // GBAMemoryClearAGBPrint
-        self.memory.active_region = -1;
+        self.memory_clear_agb_print();
         self.memory.prefetch = false;
         self.memory.last_prefetched_pc = 0;
         self.memory.savedata.reset();
@@ -250,6 +288,7 @@ impl Gba {
             FetchRegion::VramHi => hw32(&self.video.vram, a + 0x10000),
             FetchRegion::Oam => hw32(&self.video.oam, a),
             FetchRegion::Bad => DEADBEEF,
+            FetchRegion::AgbPrintFunc => AGB_PRINT_FUNC,
         }
     }
 
@@ -266,6 +305,7 @@ impl Gba {
             FetchRegion::VramHi => self.video.vram[(a + 0x10000) >> 1] as u32,
             FetchRegion::Oam => self.video.oam[a >> 1] as u32,
             FetchRegion::Bad => DEADBEEF & 0xFFFF,
+            FetchRegion::AgbPrintFunc => (AGB_PRINT_FUNC >> ((a & 2) * 8)) & 0xFFFF,
         }
     }
 
@@ -303,15 +343,278 @@ impl Gba {
         self.cpu.memory.active_nonseq_cycles16 = self.memory.waitstates_nonseq16[r];
     }
 
+    /// `GBAMemoryClearAGBPrint`
+    pub(crate) fn memory_clear_agb_print(&mut self) {
+        self.memory.active_region = -1;
+        self.memory.agb_print = AgbPrint::default();
+    }
+
+    /// Write `value` at `offset` of the ROM image (`_pristineCow` + `STORE_16`).
+    fn rom_store16(&mut self, offset: usize, value: u16) {
+        if offset + 2 > self.memory.rom.len() {
+            return;
+        }
+        if std::sync::Arc::get_mut(&mut self.memory.rom).is_none() {
+            self.memory.rom = std::sync::Arc::from(self.memory.rom.to_vec());
+        }
+        let rom = std::sync::Arc::get_mut(&mut self.memory.rom).unwrap();
+        rom[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn rom_load16(&self, offset: usize) -> u16 {
+        self.memory.rom.get(offset..offset + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    /// The AGBPrint branch of `GBAStore16` for ROM0/ROM0_EX. Returns whether
+    /// the write was taken.
+    fn agb_print_store_register(&mut self, address: u32, value: u16) -> bool {
+        if (address & 0x00FF_FFFF) < AGB_PRINT_BASE {
+            return false;
+        }
+        let agb_print_addr = address & 0x00FF_FFFF;
+        if agb_print_addr == AGB_PRINT_PROTECT {
+            self.memory.agb_print.protect = value;
+
+            if self.memory.agb_print.buffer.is_none() {
+                self.memory.agb_print.buffer = Some(vec![0; SIZE_AGB_PRINT as usize]);
+                if self.memory.rom_size >= SIZE_ROM0 / 2 {
+                    let mut base = 0;
+                    if self.memory.rom_size == SIZE_ROM0 {
+                        base = address & 0x0100_0000;
+                    }
+                    self.memory.agb_print.base = base;
+                    let top = ((AGB_PRINT_TOP | base) & (SIZE_ROM0 - 1)) as usize;
+                    let backup = self
+                        .memory
+                        .rom
+                        .get(top..top + SIZE_AGB_PRINT as usize)
+                        .map(|b| b.to_vec())
+                        .unwrap_or_else(|| vec![0; SIZE_AGB_PRINT as usize]);
+                    self.memory.agb_print.buffer_backup = Some(backup);
+                    let st = ((AGB_PRINT_STRUCT | base) & (SIZE_ROM0 - 1)) as usize;
+                    self.memory.agb_print.protect_backup =
+                        self.rom_load16(((AGB_PRINT_PROTECT | base) & (SIZE_ROM0 - 1)) as usize);
+                    for i in 0..4 {
+                        self.memory.agb_print.ctx_backup[i] = self.rom_load16(st + i * 2);
+                    }
+                    let f = ((AGB_PRINT_FLUSH_ADDR | base) & (SIZE_ROM0 - 1)) as usize;
+                    self.memory.agb_print.func_backup =
+                        self.rom_load16(f) as u32 | (self.rom_load16(f + 2) as u32) << 16;
+                }
+            }
+
+            if value == 0x20 {
+                self.agb_print_store(address, value);
+            }
+            return true;
+        }
+        if self.memory.agb_print.protect == 0x20
+            && (agb_print_addr < AGB_PRINT_TOP || (agb_print_addr & 0x00FF_FFF8) == AGB_PRINT_STRUCT)
+        {
+            self.agb_print_store(address, value);
+            return true;
+        }
+        false
+    }
+
+    /// `_agbPrintStore`
+    fn agb_print_store(&mut self, address: u32, value: u16) {
+        if (address & 0x00FF_FFFF) < AGB_PRINT_TOP {
+            if let Some(buf) = self.memory.agb_print.buffer.as_mut() {
+                let off = (address & (SIZE_AGB_PRINT - 2)) as usize;
+                buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+            }
+        } else if (address & 0x00FF_FFF8) == AGB_PRINT_STRUCT {
+            self.memory.agb_print.ctx[((address & 7) >> 1) as usize] = value;
+        }
+        if self.memory.rom_size == SIZE_ROM0 {
+            self.rom_store16((address & (SIZE_ROM0 - 2)) as usize, value);
+        } else if self.memory.agb_print.ctx[1] == 0xFD && self.memory.rom_size >= SIZE_ROM0 / 2 {
+            self.rom_store16((address & (SIZE_ROM0 / 2 - 2)) as usize, value);
+        }
+    }
+
+    /// `_agbPrintLoad`
+    fn agb_print_load(&self, address: u32) -> i16 {
+        let mut value = (address >> 1) as i16;
+        // mGBA compares the full bus address here, so the buffer branch only
+        // applies to addresses below 0x00FE0000.
+        if address < AGB_PRINT_TOP {
+            if let Some(buf) = &self.memory.agb_print.buffer {
+                let off = (address & (SIZE_AGB_PRINT - 1)) as usize & !1;
+                value = i16::from_le_bytes([buf[off], buf[off + 1]]);
+            }
+        } else if (address & 0x00FF_FFF8) == AGB_PRINT_STRUCT {
+            value = self.memory.agb_print.ctx[((address & 7) >> 1) as usize] as i16;
+        }
+        value
+    }
+
+    /// The AGBPrint part of `GBAAdjustWaitstates`: with PHI output enabled
+    /// the debug cartridge's RAM shows through the ROM; otherwise the
+    /// original ROM contents come back.
+    fn agb_print_swap_rom(&mut self, phi_on: bool) {
+        let base = self.memory.agb_print.base;
+        let top = ((AGB_PRINT_TOP | base) & (SIZE_ROM0 - 1)) as usize;
+        let ap = self.memory.agb_print.clone();
+        let (data, protect, ctx, func) = if phi_on {
+            (ap.buffer.unwrap_or_default(), ap.protect, ap.ctx, AGB_PRINT_FUNC)
+        } else {
+            (ap.buffer_backup.unwrap_or_default(), ap.protect_backup, ap.ctx_backup, ap.func_backup)
+        };
+        if top + data.len() <= self.memory.rom.len() {
+            if std::sync::Arc::get_mut(&mut self.memory.rom).is_none() {
+                self.memory.rom = std::sync::Arc::from(self.memory.rom.to_vec());
+            }
+            std::sync::Arc::get_mut(&mut self.memory.rom).unwrap()[top..top + data.len()].copy_from_slice(&data);
+        }
+        self.rom_store16(((AGB_PRINT_PROTECT | base) & (SIZE_ROM0 - 1)) as usize, protect);
+        let st = ((AGB_PRINT_STRUCT | base) & (SIZE_ROM0 - 1)) as usize;
+        for (i, v) in ctx.iter().enumerate() {
+            self.rom_store16(st + i * 2, *v);
+        }
+        let f = ((AGB_PRINT_FLUSH_ADDR | base) & (SIZE_ROM0 - 1)) as usize;
+        self.rom_store16(f, func as u16);
+        self.rom_store16(f + 2, (func >> 16) as u16);
+    }
+
+    /// `GBAPrintFlush`
+    pub(crate) fn agb_print_flush(&mut self) {
+        let Some(buf) = self.memory.agb_print.buffer.clone() else { return };
+        let mut out = Vec::new();
+        let mut i = 0;
+        while self.memory.agb_print.ctx[2] != self.memory.agb_print.ctx[3] && i < 0x100 {
+            let get = self.memory.agb_print.ctx[2] as usize;
+            let off = (get & !1) & (SIZE_AGB_PRINT as usize - 1);
+            let value = i16::from_le_bytes([buf[off], buf[off + 1]]);
+            let byte = if get & 1 != 0 { (value >> 8) as u8 } else { value as u8 };
+            out.push(byte);
+            self.memory.agb_print.ctx[2] = self.memory.agb_print.ctx[2].wrapping_add(1);
+            i += 1;
+        }
+        let get = self.memory.agb_print.ctx[2];
+        self.agb_print_store((AGB_PRINT_STRUCT + 4) | self.memory.agb_print.base, get);
+        // The C string stops at the first NUL.
+        let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
+        let text = String::from_utf8_lossy(&out[..end]).into_owned();
+        self.push_log(LogLevel::Info, format!("[GBA Debug] {text}"));
+    }
+
+    /// `_analyzeForIdleLoop`: a Thumb loop that only reads constant memory
+    /// and branches back to itself is an idle loop.
+    fn analyze_for_idle_loop(&mut self, address: u32) {
+        use crate::arm::decoder::*;
+        let mut next_address = address;
+        self.tainted_registers = [false; 16];
+        if !self.cpu.cpsr.t() {
+            self.idle_detection_step = -1;
+            return;
+        }
+        loop {
+            let opcode = self.mem_load16(next_address, None) as u16;
+            let info = decode_thumb(opcode);
+            match info.branch_type {
+                BRANCH_NONE => {
+                    if info.operand_format & OPERAND_MEMORY_2 != 0 {
+                        let base = info.memory.base_reg as usize;
+                        if info.mnemonic == Mnemonic::Str || self.tainted_registers[base] {
+                            self.idle_detection_step = -1;
+                            return;
+                        }
+                        let mut load_address = self.cached_registers[base];
+                        let mut offset = 0u32;
+                        if info.memory.format & MEMORY_IMMEDIATE_OFFSET != 0 {
+                            offset = info.memory.offset.immediate as u32;
+                        } else if info.memory.format & MEMORY_REGISTER_OFFSET != 0 {
+                            let reg = info.memory.offset.reg as usize;
+                            if self.cached_registers[reg] != 0 {
+                                self.idle_detection_step = -1;
+                                return;
+                            }
+                            offset = self.cached_registers[reg];
+                        }
+                        if info.memory.format & MEMORY_OFFSET_SUBTRACT != 0 {
+                            load_address = load_address.wrapping_sub(offset);
+                        } else {
+                            load_address = load_address.wrapping_add(offset);
+                        }
+                        let region = load_address >> BASE_OFFSET;
+                        // mGBA passes the full address here, which never matches a
+                        // register offset, so any I/O read ends detection.
+                        if region == REGION_IO && !super::io::is_read_constant(load_address) {
+                            self.idle_detection_step = -1;
+                            return;
+                        }
+                        let rd = info.op1.reg as usize & 0xF;
+                        if !(REGION_ROM0..=REGION_ROM2_EX).contains(&region) {
+                            self.tainted_registers[rd] = true;
+                        } else {
+                            match info.memory.width {
+                                1 => self.cached_registers[rd] = self.mem_load8(load_address, None),
+                                2 => self.cached_registers[rd] = self.mem_load16(load_address, None),
+                                4 => self.cached_registers[rd] = self.mem_load32(load_address, None),
+                                _ => {}
+                            }
+                        }
+                    } else if info.operand_format & OPERAND_AFFECTED_1 != 0 {
+                        self.tainted_registers[info.op1.reg as usize & 0xF] = true;
+                    }
+                    next_address = next_address.wrapping_add(WORD_SIZE_THUMB);
+                }
+                BRANCH => {
+                    if (info.op1.immediate as u32).wrapping_add(next_address).wrapping_add(WORD_SIZE_THUMB * 2) == address {
+                        self.idle_loop = address;
+                        self.idle_optimization = IdleLoopOptimization::Remove;
+                    }
+                    self.idle_detection_step = -1;
+                    return;
+                }
+                _ => {
+                    self.idle_detection_step = -1;
+                    return;
+                }
+            }
+        }
+    }
+
     /// `GBASetActiveRegion`
     pub(crate) fn set_active_region_impl(&mut self, address: u32) {
         let new_region = (address >> BASE_OFFSET) as i32;
-        if self.idle_optimization as i32 >= 0 && self.memory.active_region != REGION_BIOS as i32 && address == self.idle_loop {
-            if self.halt_pending {
-                self.halt_pending = false;
-                self.halt();
-            } else {
-                self.halt_pending = true;
+        if self.idle_optimization as i32 >= IdleLoopOptimization::Remove as i32
+            && self.memory.active_region != REGION_BIOS as i32
+        {
+            if address == self.idle_loop {
+                if self.halt_pending {
+                    self.halt_pending = false;
+                    self.halt();
+                } else {
+                    self.halt_pending = true;
+                }
+            } else if self.idle_optimization as i32 >= IdleLoopOptimization::Detect as i32
+                && new_region == self.memory.active_region
+            {
+                if address == self.last_jump {
+                    match self.idle_detection_step {
+                        0 => {
+                            self.cached_registers = self.cpu.gprs;
+                            self.idle_detection_step += 1;
+                        }
+                        1 => {
+                            if self.cached_registers != self.cpu.gprs {
+                                self.idle_detection_step = -1;
+                                self.idle_detection_failures += 1;
+                                if self.idle_detection_failures > IDLE_LOOP_THRESHOLD {
+                                    self.idle_optimization = IdleLoopOptimization::Ignore;
+                                }
+                            } else {
+                                self.analyze_for_idle_loop(address);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    self.idle_detection_step = 0;
+                }
             }
         }
 
@@ -365,6 +668,12 @@ impl Gba {
             REGION_ROM0..=REGION_ROM2_EX if (address & (SIZE_ROM0 - 1)) < self.memory.rom_size => {
                 self.memory.fetch = FetchRegion::Rom;
                 self.cpu.memory.active_mask = self.memory.rom_mask;
+            }
+            REGION_ROM0..=REGION_ROM2_EX
+                if (address & 0x00FF_FFFE) == AGB_PRINT_FLUSH_ADDR && self.memory.agb_print.protect == 0x20 =>
+            {
+                self.memory.fetch = FetchRegion::AgbPrintFunc;
+                self.cpu.memory.active_mask = 3;
             }
             _ => {
                 self.memory.active_region = -1;
@@ -557,6 +866,16 @@ impl Gba {
                 wait = self.memory.waitstates_nonseq16[(address >> BASE_OFFSET) as usize];
                 if (address & (SIZE_ROM0 - 2)) < self.memory.rom_size {
                     self.rom_read16((address & (SIZE_ROM0 - 2)) as usize)
+                } else if (address & (SIZE_ROM0 - 2)) >= AGB_PRINT_BASE
+                    && ((address & 0x00FF_FFFF) == AGB_PRINT_PROTECT
+                        || (address & 0x00FF_FFFF) < AGB_PRINT_TOP
+                        || (address & 0x00FF_FFF8) == AGB_PRINT_STRUCT)
+                {
+                    if (address & 0x00FF_FFFF) == AGB_PRINT_PROTECT {
+                        self.memory.agb_print.protect as u32
+                    } else {
+                        self.agb_print_load(address) as u16 as u32
+                    }
                 } else {
                     glog!(self, LogLevel::GameError, "Out of bounds ROM Load16: 0x{:08X}", address);
                     (address >> 1) & 0xFFFF
@@ -824,6 +1143,7 @@ impl Gba {
                     } else {
                         self.gpio_write(address & 0xFFFFFE, value);
                     }
+                } else if self.agb_print_store_register(address, value) {
                 } else {
                     glog!(self, LogLevel::GameError, "Bad cartridge Store16: 0x{:08X}", address);
                 }
@@ -1112,6 +1432,11 @@ impl Gba {
 
         m.prefetch = prefetch;
         self.update_active_cycles_raw();
+
+        if self.memory.agb_print.buffer_backup.is_some() {
+            let phi = (parameters >> 11) & 3;
+            self.agb_print_swap_rom(phi == 3);
+        }
 
         if self.performing_dma != 0 {
             self.dma_recalculate_cycles();

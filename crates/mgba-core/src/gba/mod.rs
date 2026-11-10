@@ -10,6 +10,7 @@ pub mod bios;
 pub mod dma;
 pub mod gpio;
 pub mod io;
+pub mod mcore;
 pub mod memory;
 pub mod overrides;
 pub mod psg;
@@ -100,6 +101,10 @@ pub struct Gba {
     /// `sio.driver`: the link cable, when one is attached.
     #[serde(skip)]
     pub sio_driver: Option<GbaSioDriver>,
+    /// The debugger's breakpoints and watchpoints while one is attached
+    /// (`CPU_COMPONENT_DEBUGGER`).
+    #[serde(skip)]
+    pub debugger: Option<Box<crate::debugger::Platform>>,
     pub timers: [Timer; 4],
 
     pub bus: u32,
@@ -118,6 +123,16 @@ pub struct Gba {
     pub idle_loop: u32,
     pub last_jump: u32,
     pub halt_pending: bool,
+    /// Idle-loop detection progress (`idleDetectionStep`, `idleDetectionFailures`,
+    /// `cachedRegisters`, `taintedRegisters`); not part of save states, as in mGBA.
+    #[serde(skip)]
+    pub idle_detection_step: i32,
+    #[serde(skip)]
+    pub idle_detection_failures: i32,
+    #[serde(skip)]
+    pub cached_registers: [u32; 16],
+    #[serde(skip)]
+    pub tainted_registers: [bool; 16],
     pub cpu_blocked: bool,
     pub early_exit: bool,
     pub dma_pc: u32,
@@ -135,7 +150,8 @@ pub struct Gba {
     /// Set when the game hits a fatal condition (e.g. jumped to an invalid address).
     pub crashed: bool,
     /// Messages logged by the core since the frontend last drained them.
-    /// Active cheats (`CPU_COMPONENT_CHEAT_DEVICE`), applied at the end of each frame.
+    /// Active cheats (`CPU_COMPONENT_CHEAT_DEVICE`), applied at the end of
+    /// each frame or, for hooked GBA codes, at their hook address.
     #[serde(skip)]
     pub cheats: crate::cheats::CheatDevice,
     #[serde(skip)]
@@ -179,6 +195,7 @@ impl Gba {
             audio: Audio::new(),
             sio: Sio::default(),
             sio_driver: None,
+            debugger: None,
             timers: [Timer::default(); 4],
             bus: 0,
             performing_dma: 0,
@@ -191,6 +208,10 @@ impl Gba {
             bios_checksum: 0,
             idle_optimization: IdleLoopOptimization::Remove,
             idle_loop: IDLE_LOOP_NONE,
+            idle_detection_step: 0,
+            idle_detection_failures: 0,
+            cached_registers: [0; 16],
+            tainted_registers: [false; 16],
             last_jump: 0,
             halt_pending: false,
             cpu_blocked: false,
@@ -318,6 +339,8 @@ impl Gba {
 
         self.last_jump = 0;
         self.halt_pending = false;
+        self.idle_detection_step = 0;
+        self.idle_detection_failures = 0;
         self.debug = false;
         self.debug_string = [0; 0x100];
         self.crashed = false;
@@ -339,6 +362,15 @@ impl Gba {
             self.skip_bios();
         }
         self.timing.interrupt();
+    }
+
+    /// The `idleOptimization` setting as `_GBACoreLoadConfig` applies it:
+    /// detection only runs when no idle loop is known for the game.
+    pub fn set_idle_optimization(&mut self, mode: IdleLoopOptimization) {
+        self.idle_optimization = match mode {
+            IdleLoopOptimization::Detect if self.idle_loop != IDLE_LOOP_NONE => IdleLoopOptimization::Remove,
+            m => m,
+        };
     }
 
     /// `GBASkipBIOS`
@@ -434,6 +466,30 @@ impl Gba {
         self.debug_flags &= !0x100;
     }
 
+    /// `GBABreakpoint`: a `BKPT` the emulator planted. 0 is a debugger
+    /// software breakpoint, 1 a cheat hook; anything else is undefined.
+    fn gba_breakpoint(&mut self, immediate: u32) {
+        let width = if self.cpu.cpsr.t() { arm::WORD_SIZE_THUMB } else { arm::WORD_SIZE_ARM };
+        let pc_address = self.cpu.gprs[arm::ARM_PC].wrapping_sub(width * 2);
+        match immediate {
+            crate::debugger::DEBUGGER_BKPT if self.debugger.is_some() => {
+                self.debugger_breakpoint(pc_address);
+                return;
+            }
+            crate::cheats::CHEAT_DEVICE_BKPT if !self.cheats.sets.is_empty() => {
+                let mut cheats = std::mem::take(&mut self.cheats);
+                let hook = cheats.hook_hit(self, pc_address);
+                self.cheats = cheats;
+                if let Some(opcode) = hook {
+                    arm::run_fake(self, opcode);
+                }
+                return;
+            }
+            _ => {}
+        }
+        arm::raise_undefined(self);
+    }
+
     /// `GBAInterrupt`
     pub fn interrupt(&mut self) {
         self.early_exit = true;
@@ -489,7 +545,7 @@ impl Gba {
         }
         if !self.cheats.sets.is_empty() {
             let mut cheats = std::mem::take(&mut self.cheats);
-            cheats.refresh_all(self);
+            cheats.refresh_frame(self);
             self.cheats = cheats;
         }
     }
@@ -635,32 +691,57 @@ impl ArmBus for Gba {
     }
     #[inline]
     fn load32(&mut self, address: u32, cc: Option<&mut i32>) -> u32 {
+        if self.debugger.is_some() {
+            self.debug_watch(address, crate::debugger::WATCHPOINT_READ, 0, 4);
+        }
         self.mem_load32(address, cc)
     }
     #[inline]
     fn load16(&mut self, address: u32, cc: Option<&mut i32>) -> u32 {
+        if self.debugger.is_some() {
+            self.debug_watch(address, crate::debugger::WATCHPOINT_READ, 0, 2);
+        }
         self.mem_load16(address, cc)
     }
     #[inline]
     fn load8(&mut self, address: u32, cc: Option<&mut i32>) -> u32 {
+        if self.debugger.is_some() {
+            self.debug_watch(address, crate::debugger::WATCHPOINT_READ, 0, 1);
+        }
         self.mem_load8(address, cc)
     }
     #[inline]
     fn store32(&mut self, address: u32, value: u32, cc: Option<&mut i32>) {
+        if self.debugger.is_some() {
+            self.debug_watch(address, crate::debugger::WATCHPOINT_WRITE, value, 4);
+        }
         self.mem_store32(address, value, cc)
     }
     #[inline]
     fn store16(&mut self, address: u32, value: u16, cc: Option<&mut i32>) {
+        if self.debugger.is_some() {
+            // mGBA passes the signed halfword, sign-extended to 32 bits.
+            self.debug_watch(address, crate::debugger::WATCHPOINT_WRITE, value as i16 as i32 as u32, 2);
+        }
         self.mem_store16(address, value, cc)
     }
     #[inline]
     fn store8(&mut self, address: u32, value: u8, cc: Option<&mut i32>) {
+        if self.debugger.is_some() {
+            self.debug_watch(address, crate::debugger::WATCHPOINT_WRITE, value as i8 as i32 as u32, 1);
+        }
         self.mem_store8(address, value, cc)
     }
     fn load_multiple(&mut self, address: u32, mask: u32, direction: u32, cc: &mut i32) -> u32 {
+        if self.debugger.is_some() {
+            self.debug_watch_multiple(address, mask, direction, crate::debugger::WATCHPOINT_READ);
+        }
         self.mem_load_multiple(address, mask, direction, Some(cc))
     }
     fn store_multiple(&mut self, address: u32, mask: u32, direction: u32, cc: &mut i32) -> u32 {
+        if self.debugger.is_some() {
+            self.debug_watch_multiple(address, mask, direction, crate::debugger::WATCHPOINT_WRITE);
+        }
         self.mem_store_multiple(address, mask, direction, Some(cc))
     }
     #[inline(always)]
@@ -700,11 +781,11 @@ impl ArmBus for Gba {
     fn hit_stub(&mut self, opcode: u32) {
         glog!(self, LogLevel::Error, "Stub opcode: {:08x}", opcode);
     }
-    fn bkpt16(&mut self, _immediate: u32) {
-        arm::raise_undefined(self);
+    fn bkpt16(&mut self, immediate: u32) {
+        self.gba_breakpoint(immediate);
     }
-    fn bkpt32(&mut self, _immediate: u32) {
-        arm::raise_undefined(self);
+    fn bkpt32(&mut self, immediate: u32) {
+        self.gba_breakpoint(immediate);
     }
     fn read_cpsr(&mut self) {
         self.test_irq(0);
