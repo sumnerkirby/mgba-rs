@@ -6,7 +6,14 @@ This is a faithful port: the CPUs, memory maps, scheduler, DMA, timers, audio an
 
 ## How this port was made
 
-This port was reconstructed with AI assistance: the C sources were translated to Rust function by function by an AI coding assistant (Anthropic's Claude), under human direction, and checked against mGBA's own regression suite and, for save states, against mGBA itself. Some emulator porters and decompilation communities don't want AI-generated reconstructions mixed into their projects, so this is a separate repository rather than a fork of mGBA, and nothing here has been submitted upstream.
+This port was reconstructed with AI assistance: the C sources were translated to Rust function by function by an AI coding assistant (Anthropic's Claude), under human direction, and checked against mGBA's own regression suite and, for save states, against mGBA itself. It is published as a case study in how far an AI-assisted rewrite of a mature codebase can go, and how to keep one honest:
+
+- **Scope.** About 39,000 lines of Rust across three crates, ported from mGBA's development branch (0.11): both CPU interpreters, both systems, the software renderers, audio, link cable, cheats, the debugger and GDB stub, and a desktop frontend. [What's ported](#whats-ported) and [TODO.md](TODO.md) list what is and isn't covered.
+- **Method.** Each Rust function names the C function it ports and follows its control flow, so the two can be read side by side and a difference can be traced to a line.
+- **Verification.** The port is held to mGBA's own measure rather than to "games seem to work": mGBA's regression suite must match its baselines pixel for pixel, including the tests mGBA itself is known to fail, where the port must produce the same wrong picture (see [Testing](#testing)). GBA save states are byte-compatible with mGBA's, and each emulator continues the other's states to identical frames.
+- **Pace.** The commit history spans a few days of work, from the first GBA core to the debugger and link cable.
+
+It is not a clean-room implementation, and doesn't claim to be: it is a translation of mGBA's source and carries mGBA's license and copyright. Some emulator porters and decompilation communities don't want AI-generated reconstructions mixed into their projects, so this is a separate repository rather than a fork of mGBA, and nothing here has been submitted upstream.
 
 mGBA-rs is not affiliated with or endorsed by mGBA or its authors. Please report problems with this port here, not to the mGBA project. All credit for the emulation itself — the hardware research, the design and the code being ported — belongs to Jeffrey Pfau and mGBA's contributors.
 
@@ -32,7 +39,9 @@ mGBA-rs is not affiliated with or endorsed by mGBA or its authors. Please report
 
 ## Building and running
 
-Needs a current stable Rust toolchain and a C compiler (Lua 5.4 is built from source for scripting).
+Needs a current stable Rust toolchain and a C compiler (Lua 5.4 is built from source for scripting). Developed and tested on Linux, where sound (ALSA) and game controllers work without extra libraries. The emulator core is portable Rust with no system dependencies; the frontend should build on other systems, but has no sound or controller backend there yet.
+
+No games are included. Use ROMs dumped from cartridges you own.
 
 ```bash
 cargo build --release
@@ -192,3 +201,5 @@ cargo run --release -p mgba-core --example mgba_state -- import game.gba game.ss
 mGBA is Copyright © 2013–2026 Jeffrey Pfau and contributors and is distributed under the [Mozilla Public License 2.0](https://www.mozilla.org/MPL/2.0/). This port translates mGBA's source code, so it is a derivative work ("Covered Software" under the MPL) and is distributed under the same license; see [`LICENSE`](LICENSE). Each source file keeps mGBA's copyright notice and the MPL header, and names the mGBA files and functions it ports. The built-in HLE BIOS (`crates/mgba-core/src/gba/hle_bios.bin`) is assembled from mGBA's `src/gba/hle-bios.s` and is covered by the same license.
 
 The app uses third-party Rust crates and Lua 5.4 under their own permissive licenses; see [`NOTICE.md`](NOTICE.md). mGBA's test ROMs and video logs are used from `mgba-master/` at test time and are not part of this repository. No game ROMs, BIOS dumps or boot ROMs are included.
+
+Game Boy, Game Boy Color and Game Boy Advance are trademarks of Nintendo. This project is not affiliated with, endorsed by or sponsored by Nintendo.

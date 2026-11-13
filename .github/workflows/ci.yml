@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The pixel-exact tests need mGBA's regression suite in mgba-master/
+      # (see the README) and skip here; the headless tests still run.
+      - name: Build
+        run: cargo build --release --workspace --all-targets --locked
+      - name: Test
+        run: cargo test --release --workspace --locked
